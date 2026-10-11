@@ -615,7 +615,13 @@ def _refresh_config_cache(config_path: Path | None = None) -> None:
                     try:
                         _thread_ctx.block_process_env_fallback = False
                         _thread_ctx.env = {}
-                        _cfg_cache.update(_expand_env_vars(loaded))
+                        _expanded = _expand_env_vars(loaded)
+                        # A plaintext connection snapshot persisted by an earlier build
+                        # of the #8026 branch would otherwise stay readable in the
+                        # shared cache and be written back by the next save; digest it
+                        # here, on the fresh expanded structure (#8026 r19).
+                        _migrate_picker_written_connection_snapshots(_expanded)
+                        _cfg_cache.update(_expanded)
                     finally:
                         _thread_ctx.block_process_env_fallback = _prev_block
                         if _prev_env is None:
@@ -830,9 +836,15 @@ def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
         raise RuntimeError("PyYAML is required to write Hermes config.yaml") from exc
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    saved = _config_for_yaml_save(config_data)
+    # A plaintext connection snapshot written by an earlier build of the #8026 branch
+    # would otherwise be written back verbatim, keeping a second copy of a credential
+    # alive in the file. Replace it with the digest that now stands for it, on the way
+    # to disk. Every writer goes through here (#8026 r19).
+    _migrate_picker_written_connection_snapshots(saved)
     _paths._atomic_write_text(
         config_path,
-        _yaml.safe_dump(_config_for_yaml_save(config_data), sort_keys=False, allow_unicode=True),
+        _yaml.safe_dump(saved, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
     # Invalidate the memoized parse for this path so the next read re-parses the
@@ -1504,8 +1516,9 @@ def _custom_provider_identity_owners(
     ``providers: {晨光: {name: custom:晨光}}`` both count as owners.
 
     A generic record that belongs to no slug by its own key — ``providers['custom']``,
-    or a bare-``custom`` ``model:`` block — owns one only by NAMING it, through its
-    display ``name`` or its ``provider_key``. ``name`` is read only for a
+    or a bare-``custom`` ``model:`` block, owns one only by NAMING it, through any
+    field of :data:`_CUSTOM_RECORD_IDENTITY_FIELDS` (``provider_key``, ``provider``,
+    ``custom_provider``) or the display ``name``. ``name`` is read only for a
     ``providers:`` record: a ``model:`` block's ``name`` is the MODEL's name and names
     no provider (#8026 r14).
     """
@@ -1526,13 +1539,14 @@ def _custom_provider_identity_owners(
             if isinstance(record, dict):
                 # A generic ``providers['custom']`` record belongs to no slug by its own
                 # key, so it owns one only by NAMING it: by display ``name`` (the Hermes
-                # v12 alias shape) or by ``provider_key``, the identity field the
-                # installed Agent's own alias matcher reads. Omitting ``provider_key``
-                # left such a record invisible here, so a new same-slug fallback entry
-                # minted the identity and the alias-owned route switched endpoints and
-                # failed ``auth_mismatch`` where master completed (#8026 r14).
-                values.append(record.get("name"))
-                values.append(record.get("provider_key"))
+                # v12 alias shape), or by any field the resolver itself treats as that
+                # record's identity: ``provider_key``, ``provider``,
+                # ``custom_provider`` (:func:`_custom_record_claims_slug`, the same
+                # vocabulary). Omitting a field left such a record invisible here, so a
+                # new same-slug fallback entry minted the identity and the alias-owned
+                # route switched endpoints and failed ``auth_mismatch`` where master
+                # completed (#8026 r14, r19).
+                values.extend(record.get(field) for field in _CUSTOM_RECORD_IDENTITY_FIELDS)
             for value in values:
                 if not str(value or "").strip():
                     continue
@@ -1609,12 +1623,14 @@ def _custom_record_declares_credential_source(record: object) -> bool:
 # user wrote themselves never carries it, and the recorded id must still be the
 # block's own provider for it to mean anything. The Agent never reads the field.
 PICKER_WRITTEN_FOR_FIELD = "picker_written_for"
-# The connection the Save cleanup left on the block when it wrote that mark: the
-# endpoint and every credential source the block carried at the moment of the write.
-# The mark is only trustworthy while the block still declares this connection. A CLI
-# or hand edit of ``model.base_url``/``api_key`` after the picker Save leaves the mark
-# behind on a block that no longer matches it, so the block is the user's own route
-# again (#8026 r18). The Agent never reads this field either.
+# The connection the Save cleanup left on the block when it wrote that mark, as a
+# SHA-256 digest of the endpoint and every credential source the block carried at the
+# moment of the write. The mark is only trustworthy while the block still declares this
+# connection. A CLI or hand edit of ``model.base_url``/``api_key`` after the picker Save
+# leaves the mark behind on a block that no longer matches it, so the block is the
+# user's own route again (#8026 r18). Only the digest is persisted: the fields contain
+# credentials, and a plaintext copy written here outlived the key being removed or
+# rotated (#8026 r19). The Agent never reads this field either.
 PICKER_WRITTEN_CONNECTION_FIELD = "picker_written_connection"
 
 
@@ -1643,10 +1659,10 @@ def _model_block_mirrors_fallback_entry(
     the only thing left on that slug, and it keeps master's lookup.
 
     The mark is only read while the block still declares the connection the Save
-    cleanup recorded beside it (``model.picker_written_connection``). A CLI or hand
-    edit of the block's endpoint or key after the picker Save leaves the mark behind
-    on a block that no longer matches, so the mark is stale and the edited block is
-    the user's own route again (#8026 r18).
+    cleanup recorded beside it (``model.picker_written_connection``, a digest of it). A
+    CLI or hand edit of the block's endpoint or key after the picker Save leaves the
+    mark behind on a block that no longer matches, so the mark is stale and the edited
+    block is the user's own route again (#8026 r18).
     """
     if not isinstance(model_cfg, dict) or not isinstance(custom_providers, list):
         return False
@@ -1686,41 +1702,86 @@ def _model_block_connection_changed(before: object, after: object) -> bool:
     return False
 
 
-def _model_block_connection_fingerprint(model_cfg: object) -> dict:
+def _model_block_connection_fields(model_cfg: object) -> dict:
     """The connection fields a ``model:`` block declares, as plain values.
 
     Exactly the endpoint and credential sources :func:`_model_block_connection_changed`
     compares. A field the block does not carry is absent from the result, so an absent
-    field and an explicit ``None`` stay one state here too. Stored beside the copy mark
-    and re-derived at read time, so a block edited after the picker wrote it no longer
-    matches its own mark (#8026 r18).
+    field and an explicit ``None`` stay one state here too.
     """
     if not isinstance(model_cfg, dict):
         return {}
-    fingerprint: dict[str, object] = {}
+    declared: dict[str, object] = {}
     for field in ("base_url", *CUSTOM_CREDENTIAL_SOURCE_FIELDS):
         value = model_cfg.get(field)
         if value is not None:
-            fingerprint[field] = value
-    return fingerprint
+            declared[field] = value
+    return declared
+
+
+def _model_block_connection_digest(model_cfg: object) -> str:
+    """SHA-256 digest of the connection ``model_cfg`` declares.
+
+    The value persisted beside the copy mark (``model.picker_written_connection``) and
+    re-derived at read time, so a block edited after the picker wrote it no longer
+    matches its own mark (#8026 r18). Only the DIGEST is persisted: the connection
+    fields include credentials, so keeping the fields themselves wrote a second
+    plaintext copy of ``api_key`` into ``config.yaml`` that survived the user removing
+    or rotating the key (#8026 r19). The digest covers exactly what
+    :func:`_model_block_connection_changed` compares; an empty string means the block
+    declares no connection field at all.
+    """
+    declared = _model_block_connection_fields(model_cfg)
+    if not declared:
+        return ""
+    payload = json.dumps(declared, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _picker_written_mark_still_describes_block(model_cfg: object) -> bool:
     """True when the picker's copy mark still describes ``model_cfg``'s connection.
 
-    The Save cleanup writes the mark and, beside it, the connection it wrote
-    (``model.picker_written_connection``). A CLI or hand edit of ``model.base_url`` or
-    a credential source after the picker Save leaves the mark on a block that no longer
-    matches, so the mark is stale and the block is the user's own route again (#8026
-    r18). A block that carries the mark but no recorded connection predates the
-    fingerprint, so the mark is read exactly as it was before.
+    The Save cleanup writes the mark and, beside it, a digest of the connection it
+    wrote (``model.picker_written_connection``). A CLI or hand edit of
+    ``model.base_url`` or a credential source after the picker Save leaves the mark on
+    a block that no longer matches, so the mark is stale and the block is the user's
+    own route again (#8026 r18). A block that carries the mark but no digest predates
+    the fingerprint, so the mark is read exactly as it was before. A PLAINTEXT snapshot
+    written by an earlier build of this branch is digested here before the comparison,
+    so such a config keeps working until the migration replaces it (#8026 r19).
     """
     if not isinstance(model_cfg, dict):
         return False
     recorded = model_cfg.get(PICKER_WRITTEN_CONNECTION_FIELD)
-    if not isinstance(recorded, dict):
+    if isinstance(recorded, dict):
+        recorded = _model_block_connection_digest(recorded)
+    elif not isinstance(recorded, str):
         return True
-    return _model_block_connection_fingerprint(model_cfg) == recorded
+    return _model_block_connection_digest(model_cfg) == recorded
+
+
+def _migrate_picker_written_connection_snapshots(config_data: object) -> None:
+    """Replace plaintext ``picker_written_connection`` snapshots with their digest.
+
+    An earlier build of the #8026 branch persisted the connection fields themselves,
+    and those include credentials, so the copy has to leave the file. Every plaintext
+    dict under :data:`PICKER_WRITTEN_CONNECTION_FIELD` is replaced in place by the
+    digest that now stands for it; digesting the old value preserves the comparison it
+    took part in exactly (#8026 r19). Applied on load and before a save, so an affected
+    ``config.yaml`` stops carrying the second copy of a key whether or not the user
+    touches the model settings again.
+    """
+    if isinstance(config_data, dict):
+        for value in config_data.values():
+            _migrate_picker_written_connection_snapshots(value)
+        recorded = config_data.get(PICKER_WRITTEN_CONNECTION_FIELD)
+        if isinstance(recorded, dict):
+            config_data[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_digest(
+                recorded
+            )
+    elif isinstance(config_data, list):
+        for item in config_data:
+            _migrate_picker_written_connection_snapshots(item)
 
 
 def _custom_provider_entry_identity(
@@ -7184,12 +7245,15 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
                 model_cfg.pop(_cred_field, None)
 
         if mark_written:
-            # Persist the connection this write leaves on the block, beside the mark.
-            # The mark is only read while the block still declares it, so a later CLI or
-            # hand edit (which leaves the mark behind) is told apart from the picker's
-            # own write (#8026 r18). Captured here, AFTER the credential drop above, so
-            # it records the connection the block actually keeps on disk.
-            model_cfg[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_fingerprint(
+            # Persist a DIGEST of the connection this write leaves on the block, beside
+            # the mark. The mark is only read while the block still declares it, so a
+            # later CLI or hand edit (which leaves the mark behind) is told apart from
+            # the picker's own write (#8026 r18). Captured here, AFTER the credential
+            # drop above, so it records the connection the block actually keeps on disk.
+            # A digest rather than the fields themselves: they include the key, and a
+            # plaintext copy written here outlived the user removing or rotating it
+            # (#8026 r19).
+            model_cfg[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_digest(
                 model_cfg
             )
 

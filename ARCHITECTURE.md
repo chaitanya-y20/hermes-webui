@@ -1052,15 +1052,20 @@ endpoint. Two rules:
   copy the picker wrote: `set_hermes_default_model` persists the selected entry's
   `provider` and `base_url` into the `model:` block and records that write in
   `model.picker_written_for` (`PICKER_WRITTEN_FOR_FIELD`), together with a
-  fingerprint of the connection it wrote (`model.picker_written_connection`), so a
+  SHA-256 digest of the connection it wrote (`model.picker_written_connection`), so a
   block carrying that mark for its own provider AND still declaring that recorded
   connection beside a same-slug fallback entry
   (`_model_block_mirrors_fallback_entry`) is that entry's connection, not a second
-  authority — counting it would hide the entry the moment it was selected. The mark
-  is read only while the block still matches the fingerprint, so a CLI or hand edit
+  authority, counting it would hide the entry the moment it was selected. Only the
+  digest is persisted, never the connection fields: those include the credential, and
+  writing them beside the mark left a second plaintext copy of `model.api_key` in
+  `config.yaml` that outlived the user removing or rotating the key
+  (`_migrate_picker_written_connection_snapshots` replaces such a copy with its digest
+  on load and before a save). The mark
+  is read only while the block still matches the digest, so a CLI or hand edit
   of `model.base_url`/`api_key` after the picker Save leaves the mark behind on a
   block it no longer describes and the edited block is the user's own route again.
-  The Save path clears both the mark and the fingerprint on every save that rewrites
+  The Save path clears both the mark and its digest on every save that rewrites
   the block's own connection: a pick of another provider that writes nothing else, a
   "Main model options" save that changes `base_url` or a credential source, or one
   request that does both at once, where the connection the user saved is the route

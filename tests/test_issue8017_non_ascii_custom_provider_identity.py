@@ -1869,7 +1869,7 @@ def test_a_pick_with_an_endpoint_and_key_override_keeps_the_override(
 def test_a_cli_edit_after_a_picker_save_makes_the_mark_stale(monkeypatch, tmp_path):
     """r18 CORE: an edit of the marked block stops it reading as the entry's copy.
 
-    The Save cleanup writes the mark beside a fingerprint of the connection it wrote
+    The Save cleanup writes the mark beside a digest of the connection it wrote
     (``model.picker_written_connection``). A user who then edits ``model.base_url`` /
     ``model.api_key`` with the installed CLI, or by hand in ``config.yaml``, leaves the
     mark on a block that no longer declares that connection: the mark is stale, so the
@@ -1900,8 +1900,8 @@ def test_a_cli_edit_after_a_picker_save_makes_the_mark_stale(monkeypatch, tmp_pa
     assert config.set_hermes_default_model("chat-model", provider="custom:晨光")["ok"] is True
     on_disk = config._load_yaml_config_file(cfg_path)
     assert on_disk["model"].get(config.PICKER_WRITTEN_FOR_FIELD) == "custom:晨光"
-    assert isinstance(on_disk["model"].get(config.PICKER_WRITTEN_CONNECTION_FIELD), dict), (
-        "the picker's write records the connection it left on the block"
+    assert isinstance(on_disk["model"].get(config.PICKER_WRITTEN_CONNECTION_FIELD), str), (
+        "the picker's write records a digest of the connection it left on the block"
     )
     assert config._model_block_mirrors_fallback_entry(
         on_disk["model"], "custom:晨光", on_disk.get("custom_providers")
@@ -1920,4 +1920,147 @@ def test_a_cli_edit_after_a_picker_save_makes_the_mark_stale(monkeypatch, tmp_pa
     ), "an edited block is not the picker's copy any more"
     assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-user", U2), (
         "the route serves the connection the user edited, not the entry's old one"
+    )
+
+
+@pytest.mark.parametrize("identity_field", ["provider", "custom_provider"])
+def test_a_providers_record_naming_the_slug_by_any_identity_field_owns_it(
+    monkeypatch, identity_field
+):
+    """r19 CORE: every field the resolver reads as identity reserves the route.
+
+    ``providers['custom']`` names ``custom:晨光`` through ``provider`` or
+    ``custom_provider``, the same vocabulary :func:`_custom_record_claims_slug` uses
+    when the resolver decides who owns the slug. The owner scan read only
+    ``provider_key``, so a new fallback entry named 晨光 minted the identity over the
+    record the resolver had already resolved to, took the route, and the send went to
+    the entry's endpoint where master completed at the record's (#8026 r19).
+
+    Reproduced red on ``b47338c183fa``, where only ``provider_key`` was read.
+    """
+    u_record = "http://127.0.0.1:9000/v1"
+    u_entry = "http://127.0.0.1:9500/v1"
+    cfg_shape = {
+        "model": {"provider": "custom", "default": "old-model"},
+        "providers": {
+            "custom": {
+                identity_field: "custom:晨光",
+                "base_url": u_record,
+                "api_key": "sk-X",
+            }
+        },
+        "custom_providers": [{"name": "晨光", "base_url": u_entry, "api_key": "sk-E"}],
+    }
+    monkeypatch.setattr(config, "cfg", dict(cfg_shape))
+    monkeypatch.setattr(config, "get_config", lambda: dict(cfg_shape))
+
+    assert config._custom_provider_entry_identity(
+        cfg_shape["custom_providers"][0],
+        cfg_shape["custom_providers"],
+        cfg_shape["providers"],
+        cfg_shape["model"],
+    ) == "", "the record names custom:晨光, so the entry mints nothing"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-X", u_record), (
+        "the record's own endpoint and key must keep serving custom:晨光"
+    )
+
+
+def test_a_picker_save_writes_a_digest_not_a_plaintext_credential_copy(
+    monkeypatch, tmp_path
+):
+    """r19 SILENT security: the persisted mark records a digest, never the key.
+
+    An earlier build of this branch wrote the connection fields themselves beside the
+    mark. When the pick KEEPS the block's own key, which is what an endpointless and
+    keyless fallback entry does (it inherits the model connection), that wrote a second
+    plaintext copy of ``model.api_key`` into ``config.yaml``, and the copy outlived the
+    user removing or rotating the key (#8026 r19).
+    """
+    U = "http://127.0.0.1:8317/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: sk-model\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    assert config.set_hermes_default_model("chat-model", provider="custom:晨光")["ok"] is True
+    on_disk = config._load_yaml_config_file(cfg_path)
+    # CONTROL: this save keeps the block's own key, so the mark has a credential to
+    # record. Without this the test would pass even with the plaintext snapshot.
+    assert on_disk["model"].get("api_key") == "sk-model", (
+        "the pick keeps the block's own key, so there is a credential to leak"
+    )
+    assert on_disk["model"].get(config.PICKER_WRITTEN_FOR_FIELD) == "custom:晨光"
+    recorded = on_disk["model"].get(config.PICKER_WRITTEN_CONNECTION_FIELD)
+    assert isinstance(recorded, str) and len(recorded) == 64, (
+        "the mark's connection snapshot is a SHA-256 digest, not the fields themselves"
+    )
+    assert config._picker_written_mark_still_describes_block(on_disk["model"]), (
+        "the digest still describes the block the Save left behind"
+    )
+    # The block's own api_key is its real connection and stays in the file, exactly as
+    # on master. The mark must not add a SECOND copy of it beside itself.
+    assert cfg_path.read_text(encoding="utf-8").count("sk-model") == 1, (
+        "the mark's snapshot must not add a second copy of the credential"
+    )
+
+
+def test_a_plaintext_snapshot_from_an_earlier_build_leaves_the_file(monkeypatch, tmp_path):
+    """r19: a plaintext snapshot an earlier build wrote is migrated to its digest.
+
+    A config.yaml written before the digest change carries the connection fields
+    verbatim beside the mark, so it holds a second copy of the key. Loading replaces
+    that copy with the digest it stands for and the mark still reads as live; the next
+    save writes the file without the copy, so the key does not survive in a config the
+    user never touches again (#8026 r19).
+    """
+    U = "http://127.0.0.1:8317/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: sk-model\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        "    api_key: sk-model\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+
+    config._refresh_config_cache(cfg_path)
+    loaded = dict(config.cfg)
+    recorded = loaded["model"].get(config.PICKER_WRITTEN_CONNECTION_FIELD)
+    assert isinstance(recorded, str), (
+        "load replaces the plaintext snapshot with the digest that stands for it"
+    )
+    assert config._picker_written_mark_still_describes_block(loaded["model"]), (
+        "a config written before the digest change still reads its mark as live"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        loaded["model"], "custom:晨光", loaded.get("custom_providers")
+    ), "so the route the mark described is unchanged"
+
+    # A save of that same config writes the file back without the plaintext copy, even
+    # though nothing about it was edited.
+    config._save_yaml_config_file(cfg_path, config._load_yaml_config_file(cfg_path))
+    assert cfg_path.read_text(encoding="utf-8").count("sk-model") == 1, (
+        "the save path must not keep a second copy of the credential in the file"
+    )
+    on_disk = config._load_yaml_config_file(cfg_path)
+    recorded_after = on_disk["model"].get(config.PICKER_WRITTEN_CONNECTION_FIELD)
+    assert isinstance(recorded_after, str) and len(recorded_after) == 64, (
+        "and the copy it wrote is the digest"
     )
