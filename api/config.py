@@ -1762,6 +1762,45 @@ def _expand_env_vars_to_fixpoint(obj: object, *, passes: int = 4) -> object:
     return view
 
 
+def _restore_env_references(obj: object) -> object:
+    """Write every process-env value back as the ``${NAME}`` reference it came from.
+
+    ``_expand_env_vars_to_fixpoint`` resolves a reference to whatever value the process
+    env holds when the digest is taken, and the digest is recomputed on every read, so a
+    value that ROTATES (the bearer token a saved ``key_cmd`` reads) changed the digest
+    although the command the user saved never changed: the mark then read as an edit, and
+    the non-ASCII entry the block served disappeared from the picker (greptile P1 on
+    ``c98b6bd4``). The digest has to describe the connection as DECLARED, in which an
+    env-supplied value is the reference that declared it, not the token the process
+    happens to hold today.
+
+    The expanded structure no longer records which name produced a value, so every
+    non-empty process-env value is written back, longest first so an overlapping shorter
+    value cannot split a longer one. The rule runs on the writer's side and the reader's
+    side alike, so both still agree on the connections that do not come from the env, and
+    a rotating value, a reference that is unset at read time (and so stays literal), and a
+    hand edit of the declaration all read the way the declaration says (#8026 r23).
+    """
+    references = sorted(
+        ((str(value), name) for name, value in os.environ.items() if value),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    if not references:
+        return obj
+    if isinstance(obj, str):
+        text = obj
+        for value, name in references:
+            if value in text:
+                text = text.replace(value, "${" + name + "}")
+        return text
+    if isinstance(obj, dict):
+        return {key: _restore_env_references(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_restore_env_references(item) for item in obj]
+    return obj
+
+
 def _model_block_connection_digest(model_cfg: object) -> str:
     """SHA-256 digest of the connection ``model_cfg`` declares.
 
@@ -1779,8 +1818,11 @@ def _model_block_connection_digest(model_cfg: object) -> str:
     reader that follows it agree on: a digest taken mid-chain matches in the process
     that wrote it and fails on the next load, where the reader expands the written
     text one pass further, so the mark reads as an edit and hides the entry the block
-    served (#8026 r21, r22). Expansion is pinned to the process-env view ``_cfg_cache``
-    is itself expanded in (:func:`reload_config`), never a profile-scoped one (#798).
+    served (#8026 r21, r22). A value an env var supplies is then written back as the
+    reference that declared it (:func:`_restore_env_references`), so rotating that value
+    is not read as an edit (#8026 r23). Expansion is pinned to the process-env view
+    ``_cfg_cache`` is itself expanded in (:func:`reload_config`), never a profile-scoped
+    one (#798).
     """
     declared = _model_block_connection_fields(model_cfg)
     if not declared:
@@ -1790,7 +1832,7 @@ def _model_block_connection_digest(model_cfg: object) -> str:
     try:
         _thread_ctx.block_process_env_fallback = False
         _thread_ctx.env = {}
-        canonical = _expand_env_vars_to_fixpoint(declared)
+        canonical = _restore_env_references(_expand_env_vars_to_fixpoint(declared))
     finally:
         _thread_ctx.block_process_env_fallback = prev_block
         if prev_env is None:

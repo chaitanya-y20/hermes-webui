@@ -1074,6 +1074,12 @@ endpoint. Two rules:
   (`_expand_env_vars_to_fixpoint`). That is what keeps the MCP writers and
   `_clean_provider_key_from_config`, which parse the file themselves and so reach it
   raw, recording a digest the reader recomputes, without each of them having to know.
+  A value the env supplied is then written back as the reference that declared it
+  (`_restore_env_references`), because the digest stands for the connection as DECLARED:
+  without that step, rotating the token a saved `key_cmd` reads recomputed a different
+  digest for an unchanged command, so the mark read as an edit and hid the entry the
+  block served from the picker. A reference stays a reference whether it is set, rotated
+  or unset at read time, and a hand edit of the declaration still moves the digest.
   The mark
   is read only while the block still matches the digest, so a CLI or hand edit
   of `model.base_url`/`api_key` after the picker Save leaves the mark behind on a

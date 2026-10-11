@@ -2346,3 +2346,110 @@ def test_a_raw_writer_save_of_a_legacy_snapshot_survives_the_reload(
     assert config._model_block_mirrors_fallback_entry(
         block, "custom:晨光", config.cfg.get("custom_providers")
     ), "so the entry the block serves stays visible in the picker"
+
+
+def test_rotating_the_value_a_saved_key_cmd_reads_keeps_the_mark_live(
+    monkeypatch, tmp_path
+):
+    """r23 greptile P1: the digest stands for the DECLARATION, not the value resolving it.
+
+    The saved ``key_cmd`` still carries a shell reference, so every load substitutes the
+    value the process env holds AT THAT MOMENT. A digest taken over the substituted value
+    changed when the token the command reads was rotated, although the command the user
+    saved never changed: the mark then read as an edit and the non-ASCII entry the block
+    served disappeared from the picker. Reproduced first on ``c98b6bd4``, where the mark
+    was live before the rotation, dead after it, and live again when the value was put
+    back, with the file untouched throughout.
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_KEY_CMD", "sh -c 'echo ${HERMES_SHELL_TOKEN}'")
+    monkeypatch.setenv("HERMES_SHELL_TOKEN", "sk-shell")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  key_cmd: ${HERMES_KEY_CMD}\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        "    key_cmd: ${HERMES_KEY_CMD}\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        config, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    config._refresh_config_cache(cfg_path)
+    assert config._picker_written_mark_still_describes_block(config.cfg["model"]), (
+        "the load converts the plaintext snapshot and keeps the mark live"
+    )
+    config.set_reasoning_display(True)
+    config._refresh_config_cache(cfg_path)
+    written = config._load_yaml_config_file_raw(cfg_path)["model"]
+    # CONTROL: the command the save left in the file keeps its reference, so the reader
+    # substitutes a value the env supplies and the digest has something to write back.
+    assert "HERMES_SHELL_TOKEN" in str(written.get("key_cmd")), (
+        "the saved command still declares the reference the env resolves"
+    )
+    assert written.get(config.PICKER_WRITTEN_CONNECTION_FIELD), (
+        "the save recorded a digest of the connection beside the mark"
+    )
+    block = config.cfg["model"]
+    assert block.get("key_cmd") == "sh -c 'echo sk-shell'", (
+        "the digest is taken over a value this process env supplied"
+    )
+    assert config._picker_written_mark_still_describes_block(block)
+
+    monkeypatch.setenv("HERMES_SHELL_TOKEN", "sk-rotated")
+    config._refresh_config_cache(cfg_path)
+    rotated = config.cfg["model"]
+    # CONTROL: the rotation really moved the block, and the file did not change with it.
+    assert rotated.get("key_cmd") == "sh -c 'echo sk-rotated'", (
+        "the reload resolves the saved reference to the rotated value"
+    )
+    assert (
+        config._load_yaml_config_file_raw(cfg_path)["model"].get("key_cmd")
+        == written.get("key_cmd")
+    ), "while the declaration the user saved is untouched"
+    assert config._picker_written_mark_still_describes_block(rotated), (
+        "rotating a token the saved command reads is not an edit of the block"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        rotated, "custom:晨光", config.cfg.get("custom_providers")
+    ), "so the entry the block serves stays visible in the picker"
+
+
+def test_an_env_supplied_value_digests_as_the_reference_that_declared_it(monkeypatch):
+    """r23: the digest is a function of the declaration, so a rotation does not move it.
+
+    The same invariant from the other side: a block that declares ``${VAR}`` and a block
+    that spells out what ``VAR`` resolves to are the same connection, before and after the
+    variable is rotated, while a real change of the endpoint still moves the digest.
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-declared")
+    reference = {"base_url": U, "api_key": "${HERMES_PROBE_TOKEN}"}
+    resolved = {"base_url": U, "api_key": "sk-declared"}
+    declared = config._model_block_connection_digest(reference)
+
+    assert config._model_block_connection_digest(resolved) == declared, (
+        "writing the value out is the same declaration as the reference"
+    )
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-rotated")
+    assert config._model_block_connection_digest(reference) == declared, (
+        "and the reference digests the same after the value is rotated"
+    )
+    assert config._model_block_connection_digest(
+        {"base_url": U, "api_key": "sk-rotated"}
+    ) == declared, "as does a block that spells out the rotated value"
+    assert (
+        config._model_block_connection_digest(
+            {"base_url": f"{U}/other", "api_key": "${HERMES_PROBE_TOKEN}"}
+        )
+        != declared
+    ), "CONTROL: a real change of the endpoint still moves the digest"
