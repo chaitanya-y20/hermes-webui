@@ -1521,6 +1521,13 @@ def _custom_provider_identity_owners(
     ``custom_provider``) or the display ``name``. ``name`` is read only for a
     ``providers:`` record: a ``model:`` block's ``name`` is the MODEL's name and names
     no provider (#8026 r14).
+
+    Ownership is claimed only in the vocabulary that can SERVE the route, because an
+    owner the selector cannot reach shadows the fallback entry and leaves the slug with
+    nothing: a ``providers:`` record other than ``providers['custom']`` is matched by
+    its own key or display name alone (see :func:`_unique_raw_provider_record`), so it
+    claims a slug only through those two and never through its other identity fields
+    (#8026 r20).
     """
     owners: set[str] = set()
     if isinstance(custom_providers, list):
@@ -1537,16 +1544,25 @@ def _custom_provider_identity_owners(
         for record_key, record in providers_cfg.items():
             values = [record_key]
             if isinstance(record, dict):
-                # A generic ``providers['custom']`` record belongs to no slug by its own
-                # key, so it owns one only by NAMING it: by display ``name`` (the Hermes
-                # v12 alias shape), or by any field the resolver itself treats as that
-                # record's identity: ``provider_key``, ``provider``,
-                # ``custom_provider`` (:func:`_custom_record_claims_slug`, the same
-                # vocabulary). Omitting a field left such a record invisible here, so a
-                # new same-slug fallback entry minted the identity and the alias-owned
-                # route switched endpoints and failed ``auth_mismatch`` where master
-                # completed (#8026 r14, r19).
-                values.extend(record.get(field) for field in _CUSTOM_RECORD_IDENTITY_FIELDS)
+                # ``name`` is read for EVERY record: it is one of the two fields
+                # :func:`_unique_raw_provider_record` matches a raw ``providers:<key>``
+                # record by, the other being its own key. The rest of
+                # :data:`_CUSTOM_RECORD_IDENTITY_FIELDS` is read only for the generic
+                # ``providers['custom']`` record, whose own key names no slug: that is
+                # the ONE record :func:`_select_custom_provider_record` reads them from
+                # (:func:`_custom_record_claims_slug`). Omitting them there left the
+                # record invisible in this scan, so a new same-slug fallback entry
+                # minted the identity and the alias-owned route switched endpoints and
+                # failed ``auth_mismatch`` where master completed (#8026 r14, r19).
+                # Reading them for a record the selector matches by key or display name
+                # ALONE claimed an ownership the selector could never serve: the
+                # fallback entry was shadowed here AND no record served the slug, so
+                # both the catalog group and the named route disappeared (#8026 r20).
+                values.append(record.get("name"))
+                if str(record_key or "") == "custom":
+                    values.extend(
+                        record.get(field) for field in _CUSTOM_RECORD_IDENTITY_FIELDS
+                    )
             for value in values:
                 if not str(value or "").strip():
                     continue
@@ -1738,6 +1754,37 @@ def _model_block_connection_digest(model_cfg: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _persisted_picker_connection_digest(recorded: object) -> str:
+    """Digest that replaces a plaintext ``picker_written_connection`` snapshot.
+
+    The persisted digest is compared by :func:`_picker_written_mark_still_describes_block`
+    against the ``model:`` block of the LOADED config, which is env-EXPANDED, so a
+    converted snapshot has to be digested in that same view. A snapshot converted on a
+    writer that reached the file RAW would otherwise be digested as written: the
+    credential reference ``${VAR}`` was hashed literally and could never match the block
+    it came from, so the mark read as an edit and hid the entry the block served
+    (``set_max_tokens`` is exactly such a writer: it loads through
+    :func:`_load_yaml_config_file_raw`) (#8026 r20). Expansion uses the process-env view
+    ``_cfg_cache`` is itself pinned to in :func:`reload_config`, never a profile-scoped
+    one (#798).
+    """
+    prev_block = getattr(_thread_ctx, "block_process_env_fallback", False)
+    prev_env = getattr(_thread_ctx, "env", None)
+    try:
+        _thread_ctx.block_process_env_fallback = False
+        _thread_ctx.env = {}
+        return _model_block_connection_digest(_expand_env_vars(recorded))
+    finally:
+        _thread_ctx.block_process_env_fallback = prev_block
+        if prev_env is None:
+            try:
+                del _thread_ctx.env
+            except AttributeError:
+                pass
+        else:
+            _thread_ctx.env = prev_env
+
+
 def _picker_written_mark_still_describes_block(model_cfg: object) -> bool:
     """True when the picker's copy mark still describes ``model_cfg``'s connection.
 
@@ -1766,17 +1813,18 @@ def _migrate_picker_written_connection_snapshots(config_data: object) -> None:
     An earlier build of the #8026 branch persisted the connection fields themselves,
     and those include credentials, so the copy has to leave the file. Every plaintext
     dict under :data:`PICKER_WRITTEN_CONNECTION_FIELD` is replaced in place by the
-    digest that now stands for it; digesting the old value preserves the comparison it
-    took part in exactly (#8026 r19). Applied on load and before a save, so an affected
-    ``config.yaml`` stops carrying the second copy of a key whether or not the user
-    touches the model settings again.
+    digest that now stands for it; digesting the old value in the loaded, expanded view
+    (:func:`_persisted_picker_connection_digest`) preserves the comparison it took part
+    in exactly, on a raw writer as well as on an expanded one (#8026 r19, r20). Applied
+    on load and before a save, so an affected ``config.yaml`` stops carrying the second
+    copy of a key whether or not the user touches the model settings again.
     """
     if isinstance(config_data, dict):
         for value in config_data.values():
             _migrate_picker_written_connection_snapshots(value)
         recorded = config_data.get(PICKER_WRITTEN_CONNECTION_FIELD)
         if isinstance(recorded, dict):
-            config_data[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_digest(
+            config_data[PICKER_WRITTEN_CONNECTION_FIELD] = _persisted_picker_connection_digest(
                 recorded
             )
     elif isinstance(config_data, list):

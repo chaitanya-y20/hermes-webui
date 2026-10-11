@@ -2064,3 +2064,92 @@ def test_a_plaintext_snapshot_from_an_earlier_build_leaves_the_file(monkeypatch,
     assert isinstance(recorded_after, str) and len(recorded_after) == 64, (
         "and the copy it wrote is the digest"
     )
+
+
+@pytest.mark.parametrize("identity_field", ["provider", "custom_provider", "provider_key"])
+def test_a_providers_record_that_cannot_serve_the_slug_owns_nothing(
+    monkeypatch, identity_field
+):
+    """r20 greptile P1: ownership may only be claimed where the selector can serve it.
+
+    A raw ``providers:<key>`` record is matched by its own key or its display name
+    alone (:func:`_unique_raw_provider_record`); selection never reads ``provider``,
+    ``custom_provider`` or ``provider_key`` off it. Counting those fields as ownership
+    shadowed the same-slug fallback entry AND left the slug with no serving record at
+    all, so the catalog group and the named route both disappeared.
+    """
+    u_record = "http://127.0.0.1:9000/v1"
+    u_entry = "http://127.0.0.1:9500/v1"
+    cfg_shape = {
+        "model": {"provider": "custom", "default": "old-model"},
+        "providers": {
+            "omni": {
+                identity_field: "custom:晨光",
+                "base_url": u_record,
+                "api_key": "sk-X",
+            }
+        },
+        "custom_providers": [{"name": "晨光", "base_url": u_entry, "api_key": "sk-E"}],
+    }
+    monkeypatch.setattr(config, "cfg", dict(cfg_shape))
+    monkeypatch.setattr(config, "get_config", lambda: dict(cfg_shape))
+
+    assert config._custom_provider_entry_identity(
+        cfg_shape["custom_providers"][0],
+        cfg_shape["custom_providers"],
+        cfg_shape["providers"],
+        cfg_shape["model"],
+    ) == "custom:晨光", (
+        "the record cannot serve custom:晨光, so it must not shadow the entry"
+    )
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-E", u_entry), (
+        "the entry the picker lists must be the connection the route serves"
+    )
+
+
+def test_a_token_limit_save_of_a_legacy_snapshot_keeps_the_mark_live(monkeypatch, tmp_path):
+    """r20 greptile P2: the converted digest describes the EXPANDED connection.
+
+    ``set_max_tokens`` reaches the file through ``_load_yaml_config_file_raw``, so a
+    plaintext snapshot whose credential is a ``${VAR}`` reference was digested as
+    written, while the reader compares against the loaded, expanded block. The digest
+    could never match, so the mark read as an edit, the block became an authority again
+    and the entry it served disappeared.
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-resolved")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: ${HERMES_PROBE_TOKEN}\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        "    api_key: ${HERMES_PROBE_TOKEN}\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        config, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+
+    config.set_max_tokens(4096)
+
+    loaded = dict(config.cfg)
+    recorded = loaded["model"].get(config.PICKER_WRITTEN_CONNECTION_FIELD)
+    assert isinstance(recorded, str) and len(recorded) == 64, (
+        "the token-limit save converts the plaintext snapshot to its digest"
+    )
+    assert config._picker_written_mark_still_describes_block(loaded["model"]), (
+        "the digest describes the expanded connection the reader compares"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        loaded["model"], "custom:晨光", loaded.get("custom_providers")
+    ), "so the mark still reads as the picker's copy and the entry it serves stays visible"
+    # CONTROL: the raw writer must still not bake the resolved credential into the file,
+    # which is the copy the digest exists to prevent.
+    assert cfg_path.read_text(encoding="utf-8").count("sk-resolved") == 0

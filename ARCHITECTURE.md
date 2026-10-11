@@ -1040,7 +1040,12 @@ endpoint. Two rules:
   those minted nothing before either, so their behaviour is unchanged.
 - **Existing owners come first.** A fallback-derived identity is admitted only
   when no pre-existing entry, `providers:` record or connection-owning `model:`
-  block already owns that slug.
+  block already owns that slug. A `providers:` record other than the generic
+  `providers['custom']` owns one only through its own config key or its display
+  `name`, the pair the selector matches that record by (`_unique_raw_provider_record`).
+  Counting its other identity fields claimed a route the selector could never serve:
+  the fallback entry was shadowed and no record served the slug at all, so both the
+  catalog group and the named route disappeared.
   A config holding both `custom:晨光` and `晨光` (or a `providers: {"custom:晨光":
   ...}` record plus a legacy `晨光` list entry) keeps resolving the record it
   always did: the legacy name owns `晨光`, so the fallback entry mints nothing
@@ -1061,7 +1066,9 @@ endpoint. Two rules:
   writing them beside the mark left a second plaintext copy of `model.api_key` in
   `config.yaml` that outlived the user removing or rotating the key
   (`_migrate_picker_written_connection_snapshots` replaces such a copy with its digest
-  on load and before a save). The mark
+  on load and before a save, digesting it in the loaded, expanded view the mark is later
+  read in (`_persisted_picker_connection_digest`), so a writer that reaches the file raw
+  (`set_max_tokens`) still records a digest that matches the block it came from). The mark
   is read only while the block still matches the digest, so a CLI or hand edit
   of `model.base_url`/`api_key` after the picker Save leaves the mark behind on a
   block it no longer describes and the edited block is the user's own route again.
