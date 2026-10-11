@@ -1066,9 +1066,13 @@ endpoint. Two rules:
   writing them beside the mark left a second plaintext copy of `model.api_key` in
   `config.yaml` that outlived the user removing or rotating the key
   (`_migrate_picker_written_connection_snapshots` replaces such a copy with its digest
-  on load and before a save, digesting it in the loaded, expanded view the mark is later
-  read in (`_persisted_picker_connection_digest`), so a writer that reaches the file raw
-  (`set_max_tokens`) still records a digest that matches the block it came from). The mark
+  on load and before a save, in the view the structure was loaded in: an already-expanded
+  config is hashed as it stands and only a raw one is env-expanded first
+  (`_persisted_picker_connection_digest`), since expansion is a single pass and expanding
+  an already-expanded value a second time is not a no-op when the value carries its own
+  `${...}` reference. That keeps a writer reaching the file raw (`set_max_tokens`)
+  recording a digest that matches the block it came from, with no second expansion
+  changing the answer for a writer that already had the loaded config). The mark
   is read only while the block still matches the digest, so a CLI or hand edit
   of `model.base_url`/`api_key` after the picker Save leaves the mark behind on a
   block it no longer describes and the edited block is the user's own route again.

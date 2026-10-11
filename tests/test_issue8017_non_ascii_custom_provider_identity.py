@@ -2153,3 +2153,65 @@ def test_a_token_limit_save_of_a_legacy_snapshot_keeps_the_mark_live(monkeypatch
     # CONTROL: the raw writer must still not bake the resolved credential into the file,
     # which is the copy the digest exists to prevent.
     assert cfg_path.read_text(encoding="utf-8").count("sk-resolved") == 0
+
+
+def test_a_legacy_snapshot_is_hashed_in_the_view_it_was_loaded_in(monkeypatch, tmp_path):
+    """r21 greptile P2: a snapshot must be digested in the view it was loaded in.
+
+    Env expansion is a single pass over ``${VAR}``, so a value an env var supplies
+    keeps any ``${...}`` it contains as literal text for whatever runs it later (a
+    ``key_cmd`` is handed to a shell). That makes expansion NOT idempotent: digesting an
+    already-expanded snapshot a second time substitutes a deeper reference that the
+    ``model:`` block the reader compares never substitutes. The two digests then differ,
+    the mark reads as an edit, and the entry the block served disappears from the picker
+    on every load (#8026 r21).
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_KEY_CMD", "sh -c 'echo ${HERMES_SHELL_TOKEN}'")
+    monkeypatch.setenv("HERMES_SHELL_TOKEN", "sk-shell")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  key_cmd: ${HERMES_KEY_CMD}\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        "    key_cmd: ${HERMES_KEY_CMD}\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+
+    config._refresh_config_cache(cfg_path)
+    loaded = dict(config.cfg)
+    # CONTROL: the loaded block is expanded ONCE, so the shell reference the env value
+    # carries is still literal. Without this the second expansion would be a no-op and
+    # the test would pass even with the double expansion it exists to catch.
+    assert "HERMES_SHELL_TOKEN" in str(loaded["model"].get("key_cmd", "")), (
+        "the load expands once: the env value's own shell reference stays literal"
+    )
+    assert config._picker_written_mark_still_describes_block(loaded["model"]), (
+        "the migrated digest must describe the block as loaded, not as re-expanded"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        loaded["model"], "custom:晨光", loaded.get("custom_providers")
+    ), "so the mark still reads as the picker's copy and the entry it serves stays visible"
+
+    # An expanded SAVE writer (every writer but ``set_max_tokens``) reaches the migration
+    # with the same already-expanded view, so it must hash the snapshot as it stands
+    # rather than expanding it a second time.
+    loaded_for_save = config._load_yaml_config_file(cfg_path)
+    snapshot_as_loaded = loaded_for_save["model"][config.PICKER_WRITTEN_CONNECTION_FIELD]
+    expected = config._model_block_connection_digest(snapshot_as_loaded)
+    config._save_yaml_config_file(cfg_path, loaded_for_save)
+    written = config._load_yaml_config_file_raw(cfg_path)
+    recorded = written["model"].get(config.PICKER_WRITTEN_CONNECTION_FIELD)
+    assert isinstance(recorded, str) and len(recorded) == 64, (
+        "the expanded save path still replaces the plaintext snapshot with its digest"
+    )
+    assert recorded == expected, (
+        "the save path must hash an already-expanded snapshot as it stands, not expand it again"
+    )
