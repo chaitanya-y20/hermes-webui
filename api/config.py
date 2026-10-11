@@ -844,8 +844,13 @@ def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     # would otherwise be written back verbatim, keeping a second copy of a credential
     # alive in the file. Replace it with the digest that now stands for it, on the way
     # to disk. Every writer goes through here, and the digest it writes is the same one
-    # whichever view this writer's structure is in (#8026 r19, r22).
-    _migrate_picker_written_connection_snapshots(saved)
+    # whichever view this writer's structure is in (#8026 r19, r22). The declarations
+    # it is measured against are the ones THIS write leaves on the file, not the
+    # pre-write file's: a writer that loaded the expanded config writes the value a
+    # `${NAME}` resolved to out in full, so a digest recorded against the pre-write
+    # declaration is one the next load cannot reproduce, and the entry the block served
+    # leaves the picker (greptile P1 on ``87780c48``, #8026 r25).
+    _migrate_picker_written_connection_snapshots(saved, raw_declarations=False)
     _paths._atomic_write_text(
         config_path,
         _yaml.safe_dump(saved, sort_keys=False, allow_unicode=True),
@@ -1890,7 +1895,10 @@ def _model_block_connection_digest(
     declaration it is about to write, which it holds in hand: the references there are
     the ones the file will carry, and reading the pre-write file's declarations instead
     would record a reference for a credential the save just wrote out in full, leaving a
-    digest no later load can reproduce.
+    digest no later load can reproduce. The snapshot migration passes ``True`` on load
+    (that structure is not being written, so the file's own declarations are the ones the
+    next read compares against) and ``False`` on the way to disk, where the structure IS
+    the file the reader will find (#8026 r25).
     """
     declared = _model_block_connection_fields(model_cfg)
     if not declared:
@@ -1941,7 +1949,9 @@ def _picker_written_mark_still_describes_block(model_cfg: object) -> bool:
     return _model_block_connection_digest(model_cfg) == recorded
 
 
-def _migrate_picker_written_connection_snapshots(config_data: object) -> None:
+def _migrate_picker_written_connection_snapshots(
+    config_data: object, *, raw_declarations: bool = True
+) -> None:
     """Replace plaintext ``picker_written_connection`` snapshots with their digest.
 
     An earlier build of the #8026 branch persisted the connection fields themselves,
@@ -1952,18 +1962,33 @@ def _migrate_picker_written_connection_snapshots(config_data: object) -> None:
     this structure loaded the config raw or expanded — #8026 r19, r21, r22). Applied on
     load and before a save, so an affected ``config.yaml`` stops carrying the second
     copy of a key whether or not the user touches the model settings again.
+
+    ``raw_declarations`` follows the same rule as the digest's: it says whose
+    DECLARATIONS the digest is measured against, which is the file the value is next
+    READ from. On load this structure is not being written, so the file's own
+    declarations stand (``True``). On the way to disk this structure IS the file the
+    reader will find, so its declarations are the ones that count (``False``): the
+    pre-write file's ``${NAME}`` is not what the reader sees once this write has
+    replaced the reference with the value it resolved to (greptile P1 on ``87780c48``
+    — a writer that loaded the expanded config wrote ``api_key`` out in full, the
+    digest recorded ``${HERMES_PROBE_TOKEN}``, and the entry the block served left the
+    picker on the next load; #8026 r25).
     """
     if isinstance(config_data, dict):
         for value in config_data.values():
-            _migrate_picker_written_connection_snapshots(value)
+            _migrate_picker_written_connection_snapshots(
+                value, raw_declarations=raw_declarations
+            )
         recorded = config_data.get(PICKER_WRITTEN_CONNECTION_FIELD)
         if isinstance(recorded, dict):
             config_data[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_digest(
-                recorded
+                recorded, raw_declarations=raw_declarations
             )
     elif isinstance(config_data, list):
         for item in config_data:
-            _migrate_picker_written_connection_snapshots(item)
+            _migrate_picker_written_connection_snapshots(
+                item, raw_declarations=raw_declarations
+            )
 
 
 def _custom_provider_entry_identity(

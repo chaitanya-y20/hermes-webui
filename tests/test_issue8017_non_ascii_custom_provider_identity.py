@@ -2542,3 +2542,80 @@ def test_a_literal_that_coincides_with_an_env_value_keeps_its_digest(
     assert config._picker_written_mark_still_describes_block(unset_block), (
         "so unsetting that variable does not age the mark"
     )
+
+
+@pytest.mark.parametrize("snapshot_holds", ["value", "reference"])
+def test_a_save_that_writes_a_declaration_out_in_full_keeps_the_mark(
+    monkeypatch, tmp_path, snapshot_holds
+):
+    """r25 greptile P1 (``api/config.py:1900``): digest the file the write leaves behind.
+
+    ``set_reasoning_display`` reaches ``config.yaml`` EXPANDED, so the
+    ``${HERMES_PROBE_TOKEN}`` the block declares is written out as the value it resolved to
+    and the reference is gone from the file. The migration digested the legacy plaintext
+    snapshot against the names the PRE-write file declared, so it recorded
+    ``${HERMES_PROBE_TOKEN}`` while the file it wrote held the literal. Every later load
+    recomputed the digest of the literal, the copy mark read as an edit, and the non-ASCII
+    entry the block served left the picker although its connection was never edited.
+    Reproduced on ``87780c48`` with both shapes of the legacy snapshot (the fields as the
+    loading build kept them, and the reference as the file spells it): the mark was live
+    before the save and dead after it in both.
+
+    ``raw_declarations`` therefore follows the digest's own rule: the declarations in play
+    are those of the file the value is next READ from, which on the way to disk is the
+    structure being written, not the file it replaces.
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-resolved")
+    snapshot_value = (
+        "sk-resolved" if snapshot_holds == "value" else "${HERMES_PROBE_TOKEN}"
+    )
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: ${HERMES_PROBE_TOKEN}\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        f"    api_key: {snapshot_value}\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        config, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    config._refresh_config_cache(cfg_path)
+    assert config._picker_written_mark_still_describes_block(config.cfg["model"]), (
+        "the load digests the plaintext snapshot against the file it read"
+    )
+
+    config.set_reasoning_display(True)
+
+    written = config._load_yaml_config_file_raw(cfg_path)["model"]
+    # CONTROL: this writer reached the file EXPANDED, so the declaration the block carried
+    # was replaced by the value it resolved to and the next load finds no reference there.
+    assert written.get("api_key") == "sk-resolved", (
+        "the save wrote the declaration out in full, which is what the digest has to match"
+    )
+    recorded = written.get(config.PICKER_WRITTEN_CONNECTION_FIELD)
+    assert isinstance(recorded, str) and len(recorded) == 64, (
+        "the save still replaced the plaintext snapshot with a digest"
+    )
+
+    config._refresh_config_cache(cfg_path)
+    block = config.cfg["model"]
+    assert block.get("api_key") == "sk-resolved", (
+        "CONTROL: the reloaded block is the baked connection the save left"
+    )
+    assert config._picker_written_mark_still_describes_block(block), (
+        "writing a declaration out in full is not an edit of the connection it declared"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        block, "custom:晨光", config.cfg.get("custom_providers")
+    ), "so the entry the block serves stays visible in the picker"
