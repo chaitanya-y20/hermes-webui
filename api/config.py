@@ -619,10 +619,11 @@ def _refresh_config_cache(config_path: Path | None = None) -> None:
                         # A plaintext connection snapshot persisted by an earlier build
                         # of the #8026 branch would otherwise stay readable in the
                         # shared cache and be written back by the next save; digest it
-                        # here, on the fresh expanded structure (#8026 r19). raw=False:
-                        # the structure is already expanded, and expanding it again would
-                        # digest a deeper substitution the loaded block never sees (#8026 r21).
-                        _migrate_picker_written_connection_snapshots(_expanded, raw=False)
+                        # here, on the fresh expanded structure. The digest is taken at
+                        # the end of the expansion chain, so every writer records the
+                        # same one and this structure gets the same one back after the
+                        # next save and reload (#8026 r19, r21, r22).
+                        _migrate_picker_written_connection_snapshots(_expanded)
                         _cfg_cache.update(_expanded)
                     finally:
                         _thread_ctx.block_process_env_fallback = _prev_block
@@ -831,7 +832,7 @@ def _config_for_yaml_save(config_data: dict) -> dict:
     return data
 
 
-def _save_yaml_config_file(config_path: Path, config_data: dict, *, raw: bool = False) -> None:
+def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     try:
         from api import yaml_compat as _yaml
     except ImportError as exc:
@@ -842,10 +843,9 @@ def _save_yaml_config_file(config_path: Path, config_data: dict, *, raw: bool = 
     # A plaintext connection snapshot written by an earlier build of the #8026 branch
     # would otherwise be written back verbatim, keeping a second copy of a credential
     # alive in the file. Replace it with the digest that now stands for it, on the way
-    # to disk. Every writer goes through here (#8026 r19). ``raw`` names the view
-    # ``config_data`` is in (see the migration helper): only a caller that reached the
-    # file through :func:`_load_yaml_config_file_raw` passes ``raw=True`` (#8026 r21).
-    _migrate_picker_written_connection_snapshots(saved, raw=raw)
+    # to disk. Every writer goes through here, and the digest it writes is the same one
+    # whichever view this writer's structure is in (#8026 r19, r22).
+    _migrate_picker_written_connection_snapshots(saved)
     _paths._atomic_write_text(
         config_path,
         _yaml.safe_dump(saved, sort_keys=False, allow_unicode=True),
@@ -1739,6 +1739,29 @@ def _model_block_connection_fields(model_cfg: object) -> dict:
     return declared
 
 
+def _expand_env_vars_to_fixpoint(obj: object, *, passes: int = 4) -> object:
+    """Expand ``${VAR}`` references until a pass changes nothing (#8026 r22).
+
+    Expansion is a SINGLE pass over each string, so a value an env var supplies keeps
+    any ``${...}`` it contains as literal text and only a later pass substitutes it
+    (``HERMES_KEY_CMD='sh -c "echo ${TOKEN}"'`` loads as that text; the next pass
+    reaches ``${TOKEN}``). How many passes a structure has been through therefore
+    depends on which writer reached ``config.yaml`` last — one that reached the file
+    raw writes the reference, one that loaded the expanded config writes the
+    substituted value — and the reader expands whatever it finds. Every one of those
+    views is in the same chain, so expanding to the end of it gives all of them one
+    answer. ``passes`` bounds a reference that expands to itself; a structure with
+    nothing left to expand costs one pass.
+    """
+    view = obj
+    for _ in range(max(1, passes)):
+        expanded = _expand_env_vars(view)
+        if expanded == view:
+            return view
+        view = expanded
+    return view
+
+
 def _model_block_connection_digest(model_cfg: object) -> str:
     """SHA-256 digest of the connection ``model_cfg`` declares.
 
@@ -1750,37 +1773,24 @@ def _model_block_connection_digest(model_cfg: object) -> str:
     or rotating the key (#8026 r19). The digest covers exactly what
     :func:`_model_block_connection_changed` compares; an empty string means the block
     declares no connection field at all.
+
+    The fields are digested at the END of the expansion chain
+    (:func:`_expand_env_vars_to_fixpoint`), which is the only view the writer and the
+    reader that follows it agree on: a digest taken mid-chain matches in the process
+    that wrote it and fails on the next load, where the reader expands the written
+    text one pass further, so the mark reads as an edit and hides the entry the block
+    served (#8026 r21, r22). Expansion is pinned to the process-env view ``_cfg_cache``
+    is itself expanded in (:func:`reload_config`), never a profile-scoped one (#798).
     """
     declared = _model_block_connection_fields(model_cfg)
     if not declared:
         return ""
-    payload = json.dumps(declared, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _persisted_picker_connection_digest(recorded: object) -> str:
-    """Digest that replaces a plaintext ``picker_written_connection`` snapshot.
-
-    The persisted digest is compared by :func:`_picker_written_mark_still_describes_block`
-    against the ``model:`` block of the LOADED config, which is env-EXPANDED, so a
-    converted snapshot has to be digested in that same view. A snapshot converted on a
-    writer that reached the file RAW would otherwise be digested as written: the
-    credential reference ``${VAR}`` was hashed literally and could never match the block
-    it came from, so the mark read as an edit and hid the entry the block served
-    (``set_max_tokens`` is exactly such a writer: it loads through
-    :func:`_load_yaml_config_file_raw`) (#8026 r20). Expansion uses the process-env view
-    ``_cfg_cache`` is itself pinned to in :func:`reload_config`, never a profile-scoped
-    one (#798). Only a RAW structure may be passed here: an already-expanded snapshot is
-    hashed directly by :func:`_migrate_picker_written_connection_snapshots`, because
-    expanding it a second time is not a no-op when the env value carries its own
-    ``${...}`` reference (#8026 r21).
-    """
     prev_block = getattr(_thread_ctx, "block_process_env_fallback", False)
     prev_env = getattr(_thread_ctx, "env", None)
     try:
         _thread_ctx.block_process_env_fallback = False
         _thread_ctx.env = {}
-        return _model_block_connection_digest(_expand_env_vars(recorded))
+        canonical = _expand_env_vars_to_fixpoint(declared)
     finally:
         _thread_ctx.block_process_env_fallback = prev_block
         if prev_env is None:
@@ -1790,6 +1800,8 @@ def _persisted_picker_connection_digest(recorded: object) -> str:
                 pass
         else:
             _thread_ctx.env = prev_env
+    payload = json.dumps(canonical, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _picker_written_mark_still_describes_block(model_cfg: object) -> bool:
@@ -1814,38 +1826,29 @@ def _picker_written_mark_still_describes_block(model_cfg: object) -> bool:
     return _model_block_connection_digest(model_cfg) == recorded
 
 
-def _migrate_picker_written_connection_snapshots(config_data: object, *, raw: bool) -> None:
+def _migrate_picker_written_connection_snapshots(config_data: object) -> None:
     """Replace plaintext ``picker_written_connection`` snapshots with their digest.
 
     An earlier build of the #8026 branch persisted the connection fields themselves,
     and those include credentials, so the copy has to leave the file. Every plaintext
     dict under :data:`PICKER_WRITTEN_CONNECTION_FIELD` is replaced in place by the
-    digest that now stands for it. The digest is compared against the ``model:`` block of
-    the LOADED config, which is env-EXPANDED, so it has to be taken in that same view:
-    ``raw`` names the view ``config_data`` is in — ``True`` when it came straight from
-    :func:`_load_yaml_config_file_raw` (``${VAR}`` references still literal), ``False``
-    when it is already expanded. Expansion is a single pass and NOT idempotent when a
-    value an env var supplies itself contains a ``${...}`` reference (a ``key_cmd`` kept
-    for the shell that runs it), so an already-expanded structure is hashed as it stands:
-    expanding it again substitutes a deeper reference the block never substitutes, the
-    digests differ, and the mark reads as an edit and hides the entry it served (#8026
-    r19, r20, r21). Applied on load and before a save, so an affected ``config.yaml``
-    stops carrying the second copy of a key whether or not the user touches the model
-    settings again.
+    digest that now stands for it (:func:`_model_block_connection_digest`, taken at the
+    end of the expansion chain, so it does not matter whether the writer that reaches
+    this structure loaded the config raw or expanded — #8026 r19, r21, r22). Applied on
+    load and before a save, so an affected ``config.yaml`` stops carrying the second
+    copy of a key whether or not the user touches the model settings again.
     """
     if isinstance(config_data, dict):
         for value in config_data.values():
-            _migrate_picker_written_connection_snapshots(value, raw=raw)
+            _migrate_picker_written_connection_snapshots(value)
         recorded = config_data.get(PICKER_WRITTEN_CONNECTION_FIELD)
         if isinstance(recorded, dict):
-            config_data[PICKER_WRITTEN_CONNECTION_FIELD] = (
-                _persisted_picker_connection_digest(recorded)
-                if raw
-                else _model_block_connection_digest(recorded)
+            config_data[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_digest(
+                recorded
             )
     elif isinstance(config_data, list):
         for item in config_data:
-            _migrate_picker_written_connection_snapshots(item, raw=raw)
+            _migrate_picker_written_connection_snapshots(item)
 
 
 def _custom_provider_entry_identity(
@@ -6819,10 +6822,7 @@ def set_max_tokens(max_tokens) -> dict[str, int | None]:
         elif parsed_max_tokens is not None:
             config_data["max_tokens"] = parsed_max_tokens
         if should_save:
-            # raw=True: this writer reached the file through _load_yaml_config_file_raw,
-            # so ${VAR} references are still literal and the migration must expand the
-            # snapshot once before digesting it (#8026 r20, r21).
-            _save_yaml_config_file(config_path, config_data, raw=True)
+            _save_yaml_config_file(config_path, config_data)
     if not should_save:
         return get_max_tokens_status()
     reload_config()

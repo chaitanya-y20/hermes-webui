@@ -1066,13 +1066,15 @@ endpoint. Two rules:
   writing them beside the mark left a second plaintext copy of `model.api_key` in
   `config.yaml` that outlived the user removing or rotating the key
   (`_migrate_picker_written_connection_snapshots` replaces such a copy with its digest
-  on load and before a save, in the view the structure was loaded in: an already-expanded
-  config is hashed as it stands and only a raw one is env-expanded first
-  (`_persisted_picker_connection_digest`), since expansion is a single pass and expanding
-  an already-expanded value a second time is not a no-op when the value carries its own
-  `${...}` reference. That keeps a writer reaching the file raw (`set_max_tokens`)
-  recording a digest that matches the block it came from, with no second expansion
-  changing the answer for a writer that already had the loaded config). The mark
+  on load and before a save, and every writer records the same digest because it is
+  taken at the END of the env-expansion chain: a writer that reached the file raw leaves
+  the `${VAR}` reference in it, one that loaded the expanded config bakes the substituted
+  value in, and the next load expands whichever it finds one pass further, so only the
+  end of that chain is a view every writer and reader share
+  (`_expand_env_vars_to_fixpoint`). That is what keeps the MCP writers and
+  `_clean_provider_key_from_config`, which parse the file themselves and so reach it
+  raw, recording a digest the reader recomputes, without each of them having to know.
+  The mark
   is read only while the block still matches the digest, so a CLI or hand edit
   of `model.base_url`/`api_key` after the picker Save leaves the mark behind on a
   block it no longer describes and the edited block is the user's own route again.

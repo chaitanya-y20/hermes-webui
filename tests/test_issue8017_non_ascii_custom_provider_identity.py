@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import sys
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
 import api.config as config
+from api import routes
 
 
 # ---------------------------------------------------------------------------
@@ -2155,16 +2157,20 @@ def test_a_token_limit_save_of_a_legacy_snapshot_keeps_the_mark_live(monkeypatch
     assert cfg_path.read_text(encoding="utf-8").count("sk-resolved") == 0
 
 
-def test_a_legacy_snapshot_is_hashed_in_the_view_it_was_loaded_in(monkeypatch, tmp_path):
-    """r21 greptile P2: a snapshot must be digested in the view it was loaded in.
+def test_a_legacy_snapshot_is_digested_at_the_end_of_the_expansion_chain(
+    monkeypatch, tmp_path
+):
+    """r21/r22 greptile: a snapshot must be digested where every view of it lands.
 
     Env expansion is a single pass over ``${VAR}``, so a value an env var supplies
     keeps any ``${...}`` it contains as literal text for whatever runs it later (a
-    ``key_cmd`` is handed to a shell). That makes expansion NOT idempotent: digesting an
-    already-expanded snapshot a second time substitutes a deeper reference that the
-    ``model:`` block the reader compares never substitutes. The two digests then differ,
-    the mark reads as an edit, and the entry the block served disappears from the picker
-    on every load (#8026 r21).
+    ``key_cmd`` is handed to a shell). A writer reaching the file raw therefore leaves
+    the reference in place, a writer that loaded the expanded config bakes the
+    substituted value in, and the reader expands whatever it finds: one, two or three
+    passes over the same text depending on who touched it last. Only the END of that
+    chain is common to all of them, so the digest is taken there (#8026 r22 — r21
+    digested in the view the structure was loaded in, which matched until the next
+    save and reload moved the block one pass further).
     """
     U = "http://127.0.0.1:8317/v1"
     monkeypatch.setenv("HERMES_KEY_CMD", "sh -c 'echo ${HERMES_SHELL_TOKEN}'")
@@ -2200,9 +2206,9 @@ def test_a_legacy_snapshot_is_hashed_in_the_view_it_was_loaded_in(monkeypatch, t
         loaded["model"], "custom:晨光", loaded.get("custom_providers")
     ), "so the mark still reads as the picker's copy and the entry it serves stays visible"
 
-    # An expanded SAVE writer (every writer but ``set_max_tokens``) reaches the migration
-    # with the same already-expanded view, so it must hash the snapshot as it stands
-    # rather than expanding it a second time.
+    # A SAVE writer reaches the migration in whichever view it loaded the config in;
+    # the digest is taken at the end of the expansion chain, so the writer and the
+    # reader that follows it record the same one (#8026 r22).
     loaded_for_save = config._load_yaml_config_file(cfg_path)
     snapshot_as_loaded = loaded_for_save["model"][config.PICKER_WRITTEN_CONNECTION_FIELD]
     expected = config._model_block_connection_digest(snapshot_as_loaded)
@@ -2213,5 +2219,130 @@ def test_a_legacy_snapshot_is_hashed_in_the_view_it_was_loaded_in(monkeypatch, t
         "the expanded save path still replaces the plaintext snapshot with its digest"
     )
     assert recorded == expected, (
-        "the save path must hash an already-expanded snapshot as it stands, not expand it again"
+        "the save path must record the digest the reader recomputes from the block"
     )
+
+
+def test_an_expanded_save_of_a_legacy_snapshot_survives_the_reload(monkeypatch, tmp_path):
+    """r22 greptile P1: the digest has to describe the connection AFTER the reload.
+
+    Every writer but ``set_max_tokens`` loads the EXPANDED config and writes it back, so
+    a ``key_cmd`` an env value supplies is baked into the file with the ``${...}`` that
+    value itself carries still literal. The next load substitutes that deeper reference,
+    so the block is no longer the string the save digested; the mark then read as an
+    edit and the entry the block served disappeared from the picker. Reproduced through
+    ``set_reasoning_display``, the writer greptile named, and read back from a reload of
+    the file the save wrote.
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_KEY_CMD", "sh -c 'echo ${HERMES_SHELL_TOKEN}'")
+    monkeypatch.setenv("HERMES_SHELL_TOKEN", "sk-shell")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  key_cmd: ${HERMES_KEY_CMD}\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        "    key_cmd: ${HERMES_KEY_CMD}\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        config, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    config._refresh_config_cache(cfg_path)
+    assert config._picker_written_mark_still_describes_block(config.cfg["model"]), (
+        "the load converts the plaintext snapshot and keeps the mark live"
+    )
+
+    config.set_reasoning_display(True)
+
+    written = config._load_yaml_config_file_raw(cfg_path)["model"]
+    # CONTROL: this writer reached the file EXPANDED, so the shell reference the env
+    # value carries is still literal in what it wrote and the next load substitutes it.
+    # Without this the test would pass on a writer that left the file raw.
+    assert "HERMES_SHELL_TOKEN" in str(written.get("key_cmd")), (
+        "the expanded save bakes a value that still carries its own reference"
+    )
+    config._refresh_config_cache(cfg_path)
+    block = config.cfg["model"]
+    assert "HERMES_SHELL_TOKEN" not in str(block.get("key_cmd")), (
+        "the reload substitutes that reference, so the block moved one pass further"
+    )
+    assert config._picker_written_mark_still_describes_block(block), (
+        "the reloaded block must still match the digest the save recorded"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        block, "custom:晨光", config.cfg.get("custom_providers")
+    ), "so the entry the block serves stays visible in the picker"
+
+
+def test_a_raw_writer_save_of_a_legacy_snapshot_survives_the_reload(
+    monkeypatch, tmp_path
+):
+    """r22 greptile P1: a writer that reached the file raw must not hide the entry.
+
+    ``_load_mcp_config_for_write`` parses the file with ``yaml.safe_load`` and the MCP
+    handlers write that mapping straight back, so the block keeps its ``${VAR}``
+    reference while the reader expands it. A snapshot converted in that view was
+    digested as written and could never match. ``_clean_provider_key_from_config`` reads
+    the file the same way. Driven through the real handler, not the writer pair.
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-resolved")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: ${HERMES_PROBE_TOKEN}\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        "    api_key: ${HERMES_PROBE_TOKEN}\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        "mcp_servers:\n"
+        "  probe:\n"
+        "    command: 'true'\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(routes, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        routes, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+
+    config._refresh_config_cache(cfg_path)
+    assert config._picker_written_mark_still_describes_block(config.cfg["model"]), (
+        "the load converts the plaintext snapshot and keeps the mark live"
+    )
+
+    routes._handle_mcp_server_toggle(MagicMock(), "probe", {"enabled": False})
+
+    written = config._load_yaml_config_file_raw(cfg_path)["model"]
+    # CONTROL: this writer reached the file RAW, so the reference is still literal there.
+    assert written.get("api_key") == "${HERMES_PROBE_TOKEN}", (
+        "the MCP handler writes the raw mapping back, reference and all"
+    )
+    assert cfg_path.read_text(encoding="utf-8").count("sk-resolved") == 0, (
+        "and still does not bake the resolved credential into the file"
+    )
+    config._refresh_config_cache(cfg_path)
+    block = config.cfg["model"]
+    assert block.get("api_key") == "sk-resolved", (
+        "the reader expands the reference the raw writer left in place"
+    )
+    assert config._picker_written_mark_still_describes_block(block), (
+        "the reloaded block must still match the digest the save recorded"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        block, "custom:晨光", config.cfg.get("custom_providers")
+    ), "so the entry the block serves stays visible in the picker"
