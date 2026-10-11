@@ -1079,7 +1079,13 @@ endpoint. Two rules:
   without that step, rotating the token a saved `key_cmd` reads recomputed a different
   digest for an unchanged command, so the mark read as an edit and hid the entry the
   block served from the picker. A reference stays a reference whether it is set, rotated
-  or unset at read time, and a hand edit of the declaration still moves the digest.
+  or unset at read time, and a hand edit of the declaration still moves the digest. Only
+  a reference the connection DECLARES is written back (`_declared_env_reference_names`,
+  plus the ones the raw file still carries on the block, read by `_raw_declared_reference_names`
+  because the read path digests an already-expanded structure): writing every env value
+  back read a literal endpoint that happened to contain `PORT`'s value as `${PORT}`,
+  so unsetting `PORT` moved the digest of a byte-identical `config.yaml` and aged the mark
+  the same way.
   The mark
   is read only while the block still matches the digest, so a CLI or hand edit
   of `model.base_url`/`api_key` after the picker Save leaves the mark behind on a

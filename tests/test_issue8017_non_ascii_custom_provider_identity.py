@@ -2424,21 +2424,47 @@ def test_rotating_the_value_a_saved_key_cmd_reads_keeps_the_mark_live(
     ), "so the entry the block serves stays visible in the picker"
 
 
-def test_an_env_supplied_value_digests_as_the_reference_that_declared_it(monkeypatch):
-    """r23: the digest is a function of the declaration, so a rotation does not move it.
+def test_an_env_supplied_value_digests_as_the_reference_that_declared_it(
+    monkeypatch, tmp_path
+):
+    """r23/r24: the digest is a function of the DECLARATION, and of a declared one only.
 
-    The same invariant from the other side: a block that declares ``${VAR}`` and a block
-    that spells out what ``VAR`` resolves to are the same connection, before and after the
-    variable is rotated, while a real change of the endpoint still moves the digest.
+    The r23 invariant from the reference side: a block that declares ``${VAR}`` and a
+    block that spells out what ``VAR`` resolves to are the same connection, before and
+    after the variable is rotated, because ``${VAR}`` is what the saved block DECLARES
+    (:func:`_raw_declared_reference_names`), while a real change of the endpoint still
+    moves the digest.
+
+    The r24 narrowing is the other half of this: a value is never written back merely
+    because it coincides with a variable, which is what
+    ``test_a_literal_that_coincides_with_an_env_value_keeps_its_digest`` pins from the
+    other side. This test keeps the declaration in the file, so the reference is one the
+    config really carries.
     """
     U = "http://127.0.0.1:8317/v1"
     monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-declared")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: ${HERMES_PROBE_TOKEN}\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        config, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+    config._refresh_config_cache(cfg_path)
+
     reference = {"base_url": U, "api_key": "${HERMES_PROBE_TOKEN}"}
     resolved = {"base_url": U, "api_key": "sk-declared"}
     declared = config._model_block_connection_digest(reference)
 
     assert config._model_block_connection_digest(resolved) == declared, (
-        "writing the value out is the same declaration as the reference"
+        "writing the value out is the same declaration as the reference the block declares"
     )
     monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-rotated")
     assert config._model_block_connection_digest(reference) == declared, (
@@ -2453,3 +2479,66 @@ def test_an_env_supplied_value_digests_as_the_reference_that_declared_it(monkeyp
         )
         != declared
     ), "CONTROL: a real change of the endpoint still moves the digest"
+
+
+def test_a_literal_that_coincides_with_an_env_value_keeps_its_digest(
+    monkeypatch, tmp_path
+):
+    """r24 greptile P1: only a DECLARED reference is written back, never a coinciding value.
+
+    ``_restore_env_references`` wrote the value of EVERY process-env variable back as
+    ``${NAME}``, so a literal endpoint that happened to contain ``PORT``'s value digested
+    as ``${PORT}``: unsetting ``PORT`` moved the digest of a byte-identical ``config.yaml``,
+    the copy mark read as an edit, and the non-ASCII entry the block served disappeared
+    from the picker (a credentialed copy could then route without the entry's key).
+    Reproduced on ``e5881b06``: the digest of that block was ``0608357a…`` with
+    ``PORT=8080`` and ``d375b983…`` with ``PORT`` unset, and the saved mark was False.
+    """
+    U = "http://localhost:8080/v1"
+    monkeypatch.setenv("PORT", "8080")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: sk-literal\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        config, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+    config._refresh_config_cache(cfg_path)
+
+    recorded = config._model_block_connection_digest(config.cfg["model"])
+    cfg_path.write_text(
+        cfg_path.read_text(encoding="utf-8").replace(
+            "  api_key: sk-literal\n",
+            "  api_key: sk-literal\n"
+            "  picker_written_for: custom:晨光\n"
+            f"  {config.PICKER_WRITTEN_CONNECTION_FIELD}: {recorded}\n",
+        ),
+        encoding="utf-8",
+    )
+    marked_text = cfg_path.read_text(encoding="utf-8")
+    config._refresh_config_cache(cfg_path)
+    assert config._picker_written_mark_still_describes_block(config.cfg["model"]), (
+        "the mark is live while the declaration is unchanged"
+    )
+
+    monkeypatch.delenv("PORT")
+    config._refresh_config_cache(cfg_path)
+    unset_block = config.cfg["model"]
+    # CONTROL: the declaration on disk did not change with the environment.
+    assert cfg_path.read_text(encoding="utf-8") == marked_text, (
+        "unsetting the variable rewrote nothing"
+    )
+    assert unset_block.get("base_url") == U, "CONTROL: the endpoint is the literal one"
+    assert config._model_block_connection_digest(unset_block) == recorded, (
+        "a value that coincides with an unrelated variable is not read as its reference"
+    )
+    assert config._picker_written_mark_still_describes_block(unset_block), (
+        "so unsetting that variable does not age the mark"
+    )

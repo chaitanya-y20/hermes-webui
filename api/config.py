@@ -1762,8 +1762,53 @@ def _expand_env_vars_to_fixpoint(obj: object, *, passes: int = 4) -> object:
     return view
 
 
-def _restore_env_references(obj: object) -> object:
-    """Write every process-env value back as the ``${NAME}`` reference it came from.
+_ENV_REFERENCE_RE = re.compile(r"\$\{([^}]+)}")
+
+
+def _declared_env_reference_names(obj: object) -> set[str]:
+    """The ``${NAME}`` references ``obj`` declares, in any of its strings.
+
+    A reference is what tells a value that came from the environment from a value
+    the user wrote out in full: only the DECLARED ones may be written back by
+    :func:`_restore_env_references` (#8026 r24).
+    """
+    names: set[str] = set()
+    stack = [obj]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            names.update(_ENV_REFERENCE_RE.findall(item))
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return names
+
+
+def _raw_declared_reference_names() -> set[str]:
+    """The ``${NAME}`` references the saved ``model:`` block still declares.
+
+    The read path digests a structure the loader has already env-expanded, so a
+    reference the file carries on a connection field is no longer visible in it
+    (``${HERMES_KEY_CMD}`` loads as the value that variable supplies). The digest
+    describes the connection as DECLARED, so the declaration is read back from the
+    raw file the block came from, and only from the connection fields the digest
+    covers, so a reference declared elsewhere on the block names nothing here
+    (#8026 r24).
+    """
+    if not _cfg_path:
+        return set()
+    try:
+        raw = _load_yaml_config_file_raw(Path(_cfg_path))
+    except Exception:  # noqa: BLE001 (a missing or unreadable file declares nothing)
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    return _declared_env_reference_names(_model_block_connection_fields(raw.get("model")))
+
+
+def _restore_env_references(obj: object, names: set[str]) -> object:
+    """Write a process-env value back as the ``${NAME}`` reference it came from.
 
     ``_expand_env_vars_to_fixpoint`` resolves a reference to whatever value the process
     env holds when the digest is taken, and the digest is recomputed on every read, so a
@@ -1774,15 +1819,26 @@ def _restore_env_references(obj: object) -> object:
     env-supplied value is the reference that declared it, not the token the process
     happens to hold today.
 
-    The expanded structure no longer records which name produced a value, so every
-    non-empty process-env value is written back, longest first so an overlapping shorter
-    value cannot split a longer one. The rule runs on the writer's side and the reader's
-    side alike, so both still agree on the connections that do not come from the env, and
-    a rotating value, a reference that is unset at read time (and so stays literal), and a
-    hand edit of the declaration all read the way the declaration says (#8026 r23).
+    Only the references ``names`` DECLARES are written back. The expanded structure no
+    longer records which name produced a value, so the name has to come from the
+    declaration (:func:`_declared_env_reference_names`); a value that merely COINCIDES
+    with an unrelated environment variable must be left alone, or unsetting that variable
+    moves the digest of a byte-identical config (``http://localhost:8080/v1`` against
+    ``PORT=8080`` read as ``${PORT}``, and the mark went stale on the next restart,
+    greptile P1 on ``e5881b06``, #8026 r24).
+
+    The names are applied longest value first, so an overlapping shorter value cannot
+    split a longer one. The rule runs on the writer's side and the reader's side alike,
+    so both still agree on the connections that do not come from the env, and a rotating
+    value, a reference that is unset at read time (and so stays literal), and a hand edit
+    of the declaration all read the way the declaration says (#8026 r23).
     """
     references = sorted(
-        ((str(value), name) for name, value in os.environ.items() if value),
+        (
+            (str(value), name)
+            for name, value in os.environ.items()
+            if value and name in names
+        ),
         key=lambda item: len(item[0]),
         reverse=True,
     )
@@ -1795,13 +1851,15 @@ def _restore_env_references(obj: object) -> object:
                 text = text.replace(value, "${" + name + "}")
         return text
     if isinstance(obj, dict):
-        return {key: _restore_env_references(value) for key, value in obj.items()}
+        return {key: _restore_env_references(value, names) for key, value in obj.items()}
     if isinstance(obj, list):
-        return [_restore_env_references(item) for item in obj]
+        return [_restore_env_references(item, names) for item in obj]
     return obj
 
 
-def _model_block_connection_digest(model_cfg: object) -> str:
+def _model_block_connection_digest(
+    model_cfg: object, *, raw_declarations: bool = True
+) -> str:
     """SHA-256 digest of the connection ``model_cfg`` declares.
 
     The value persisted beside the copy mark (``model.picker_written_connection``) and
@@ -1820,19 +1878,34 @@ def _model_block_connection_digest(model_cfg: object) -> str:
     text one pass further, so the mark reads as an edit and hides the entry the block
     served (#8026 r21, r22). A value an env var supplies is then written back as the
     reference that declared it (:func:`_restore_env_references`), so rotating that value
-    is not read as an edit (#8026 r23). Expansion is pinned to the process-env view
-    ``_cfg_cache`` is itself expanded in (:func:`reload_config`), never a profile-scoped
-    one (#798).
+    is not read as an edit (#8026 r23), but only where the connection DECLARES that
+    reference, so a literal that merely coincides with an unrelated variable is left
+    alone (#8026 r24). Expansion is pinned to the process-env view ``_cfg_cache`` is
+    itself expanded in (:func:`reload_config`), never a profile-scoped one (#798).
+
+    ``raw_declarations`` adds the references the RAW config still declares on the block,
+    and is for a caller digesting a structure that has already been env-expanded: the
+    read path and the plaintext-snapshot migration, whose structure no longer shows the
+    ``${NAME}`` the file carries. The picker Save passes ``False`` because it digests the
+    declaration it is about to write, which it holds in hand: the references there are
+    the ones the file will carry, and reading the pre-write file's declarations instead
+    would record a reference for a credential the save just wrote out in full, leaving a
+    digest no later load can reproduce.
     """
     declared = _model_block_connection_fields(model_cfg)
     if not declared:
         return ""
+    declared_names = _declared_env_reference_names(declared)
+    if raw_declarations:
+        declared_names |= _raw_declared_reference_names()
     prev_block = getattr(_thread_ctx, "block_process_env_fallback", False)
     prev_env = getattr(_thread_ctx, "env", None)
     try:
         _thread_ctx.block_process_env_fallback = False
         _thread_ctx.env = {}
-        canonical = _restore_env_references(_expand_env_vars_to_fixpoint(declared))
+        canonical = _restore_env_references(
+            _expand_env_vars_to_fixpoint(declared), declared_names
+        )
     finally:
         _thread_ctx.block_process_env_fallback = prev_block
         if prev_env is None:
@@ -7363,7 +7436,7 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
             # plaintext copy written here outlived the user removing or rotating it
             # (#8026 r19).
             model_cfg[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_digest(
-                model_cfg
+                model_cfg, raw_declarations=False
             )
 
         before_advanced = dict(model_cfg)
