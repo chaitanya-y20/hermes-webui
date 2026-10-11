@@ -2157,6 +2157,74 @@ def test_a_token_limit_save_of_a_legacy_snapshot_keeps_the_mark_live(monkeypatch
     assert cfg_path.read_text(encoding="utf-8").count("sk-resolved") == 0
 
 
+def test_a_raw_save_of_a_snapshot_holding_the_value_keeps_the_mark_live(
+    monkeypatch, tmp_path
+):
+    """r26 greptile P1 (``api/config.py:853``): digest against the block being saved.
+
+    A legacy plaintext snapshot from an earlier build stored the credential it had
+    resolved, while the ``model:`` block beside it still declares the ``${VAR}`` a raw
+    writer leaves in place. ``set_max_tokens`` reaches the file raw, and the migration
+    digested the snapshot against the references the SNAPSHOT carries — none, since the
+    value is written out in full — so it recorded the literal while the reader
+    recomputed the digest of the BLOCK, restored ``${HERMES_PROBE_TOKEN}`` from the
+    declaration the file still carries, and read the mark as an edit: the non-ASCII
+    entry the block served disappeared from the picker although its connection was
+    never edited.
+
+    The declarations that count are the ones the mapping being saved carries on its own
+    connection fields, because that mapping is the ``model:`` block the reader compares
+    against on the next load.
+    """
+    U = "http://127.0.0.1:8317/v1"
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "sk-resolved")
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: old-model\n"
+        f"  base_url: {U}\n"
+        "  api_key: ${HERMES_PROBE_TOKEN}\n"
+        "  picker_written_for: custom:晨光\n"
+        "  picker_written_connection:\n"
+        f"    base_url: {U}\n"
+        "    api_key: sk-resolved\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(
+        config, "reload_config", lambda: config._refresh_config_cache(cfg_path)
+    )
+
+    config.set_max_tokens(4096)
+
+    written = config._load_yaml_config_file_raw(cfg_path)["model"]
+    # CONTROL: this writer reached the file RAW, so the declaration is still literal
+    # there and the resolved value the snapshot held is not baked into the file.
+    assert written.get("api_key") == "${HERMES_PROBE_TOKEN}", (
+        "the raw writer leaves the block's declaration in place"
+    )
+    assert cfg_path.read_text(encoding="utf-8").count("sk-resolved") == 0, (
+        "and replaces the plaintext copy with a digest"
+    )
+    recorded = written.get(config.PICKER_WRITTEN_CONNECTION_FIELD)
+    assert isinstance(recorded, str) and len(recorded) == 64, (
+        "the save replaced the plaintext snapshot with a digest"
+    )
+    config._refresh_config_cache(cfg_path)
+    block = config.cfg["model"]
+    assert block.get("api_key") == "sk-resolved", (
+        "CONTROL: the reloaded block expands the declaration the file carries"
+    )
+    assert config._picker_written_mark_still_describes_block(block), (
+        "the snapshot's value and the block's reference are one connection"
+    )
+    assert config._model_block_mirrors_fallback_entry(
+        block, "custom:晨光", config.cfg.get("custom_providers")
+    ), "so the entry the block serves stays visible in the picker"
+
+
 def test_a_legacy_snapshot_is_digested_at_the_end_of_the_expansion_chain(
     monkeypatch, tmp_path
 ):

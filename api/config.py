@@ -623,7 +623,22 @@ def _refresh_config_cache(config_path: Path | None = None) -> None:
                         # the end of the expansion chain, so every writer records the
                         # same one and this structure gets the same one back after the
                         # next save and reload (#8026 r19, r21, r22).
-                        _migrate_picker_written_connection_snapshots(_expanded)
+                        #
+                        # The migration is DEFINED BELOW this function, and the very
+                        # first load reaches here before the module has finished
+                        # executing (``CLI_TOOLSETS -> get_config ->
+                        # reload_config_if_stale``). A bare call raised ``NameError``
+                        # into the broad ``except Exception`` at the bottom of this
+                        # function, which does not re-raise, so the WHOLE config.yaml
+                        # was silently dropped to defaults at import while every later
+                        # reload worked (#8026 r26). Apply it only once it exists; the
+                        # module applies it to the loaded cache further down, so the
+                        # startup cache is migrated too.
+                        _migration = globals().get(
+                            "_migrate_picker_written_connection_snapshots"
+                        )
+                        if _migration is not None:
+                            _migration(_expanded)
                         _cfg_cache.update(_expanded)
                     finally:
                         _thread_ctx.block_process_env_fallback = _prev_block
@@ -864,8 +879,16 @@ def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
         _yaml_file_cache.pop(str(config_path), None)
 
 
-# Initial load
-reload_config()
+# The initial load is NOT triggered here any more. ``reload_config()`` ->
+# ``_refresh_config_cache()`` calls into ``_migrate_picker_written_connection_snapshots``
+# (and the ``CUSTOM_CREDENTIAL_SOURCE_FIELDS`` tuple it reads), which are defined
+# below this point: a call here raised ``NameError`` into the broad
+# ``except Exception`` that guards the load, so the whole ``config.yaml`` was
+# silently dropped to defaults at import while every explicit ``reload_config()``
+# after startup worked (#8026 r26). The first load now comes from the
+# ``CLI_TOOLSETS`` module constant further down, and the migration the guards
+# skip there is applied to the loaded cache once the helper exists. ``cfg`` is
+# still bound here because it aliases the dict that load fills in place.
 cfg = _cfg_cache  # alias for backward compat with existing references
 
 
@@ -1863,7 +1886,10 @@ def _restore_env_references(obj: object, names: set[str]) -> object:
 
 
 def _model_block_connection_digest(
-    model_cfg: object, *, raw_declarations: bool = True
+    model_cfg: object,
+    *,
+    raw_declarations: bool = True,
+    extra_declared_names: set[str] | None = None,
 ) -> str:
     """SHA-256 digest of the connection ``model_cfg`` declares.
 
@@ -1899,6 +1925,14 @@ def _model_block_connection_digest(
     (that structure is not being written, so the file's own declarations are the ones the
     next read compares against) and ``False`` on the way to disk, where the structure IS
     the file the reader will find (#8026 r25).
+
+    ``extra_declared_names`` are declared references the CALLER knows apply to this
+    connection although the structure being digested does not spell them out. The
+    plaintext-snapshot migration uses it for the ``model:`` block the snapshot belongs
+    to: the reader digests THAT block, so a snapshot holding the value an earlier build
+    resolved must digest as the ``${NAME}`` the block beside it carries, or the recorded
+    digest and the recomputed one disagree on a connection that never changed (#8026
+    r26).
     """
     declared = _model_block_connection_fields(model_cfg)
     if not declared:
@@ -1906,6 +1940,8 @@ def _model_block_connection_digest(
     declared_names = _declared_env_reference_names(declared)
     if raw_declarations:
         declared_names |= _raw_declared_reference_names()
+    if extra_declared_names:
+        declared_names |= set(extra_declared_names)
     prev_block = getattr(_thread_ctx, "block_process_env_fallback", False)
     prev_env = getattr(_thread_ctx, "env", None)
     try:
@@ -1973,6 +2009,12 @@ def _migrate_picker_written_connection_snapshots(
     — a writer that loaded the expanded config wrote ``api_key`` out in full, the
     digest recorded ``${HERMES_PROBE_TOKEN}``, and the entry the block served left the
     picker on the next load; #8026 r25).
+
+    Whichever view the caller is in, the snapshot is digested against the declarations
+    its own enclosing ``model:`` block carries, not only the ones the snapshot spells
+    out: the reader digests that BLOCK, and a snapshot an earlier build wrote holds the
+    value it had resolved rather than the ``${NAME}`` the block declares, so the two
+    would disagree on a connection that never changed (#8026 r26).
     """
     if isinstance(config_data, dict):
         for value in config_data.values():
@@ -1981,8 +2023,21 @@ def _migrate_picker_written_connection_snapshots(
             )
         recorded = config_data.get(PICKER_WRITTEN_CONNECTION_FIELD)
         if isinstance(recorded, dict):
+            # The declarations that count are the ones the mapping this snapshot belongs
+            # to, the ``model:`` block, carries on its own connection fields. That is
+            # the block the reader digests and compares against on the next load, so a
+            # snapshot holding the value an earlier build resolved must still digest as
+            # the ``${NAME}`` declaration the block beside it carries (greptile P1 on
+            # ``fa5bd759``, #8026 r26: the snapshot held ``sk-resolved`` while the block
+            # still declared ``${HERMES_PROBE_TOKEN}``, the digest recorded the literal
+            # and the reader's recomputed one the reference).
+            own_names = _declared_env_reference_names(
+                _model_block_connection_fields(config_data)
+            )
             config_data[PICKER_WRITTEN_CONNECTION_FIELD] = _model_block_connection_digest(
-                recorded, raw_declarations=raw_declarations
+                recorded,
+                raw_declarations=raw_declarations,
+                extra_declared_names=own_names,
             )
     elif isinstance(config_data, list):
         for item in config_data:
@@ -13039,6 +13094,17 @@ def get_sessions_cache_max(config_data: dict | None = None) -> int:
     return DEFAULT_SESSIONS_CACHE_MAX
 
 
+# The import-time load (``CLI_TOOLSETS -> get_config -> reload_config_if_stale``,
+# above) could not run the plaintext-snapshot migration, because the helper is
+# defined below ``_refresh_config_cache`` (see the guard there). Apply it HERE,
+# where the helper exists, to the config that load already put in the cache, and
+# restamp the fingerprint the load takes from the cache: without the restamp the
+# in-place edit reads as an in-memory override to ``_cfg_has_in_memory_overrides``
+# and suppresses every later disk reload. That leaves the cache in exactly the
+# state a migrated load produces, without a second file read and the models-cache
+# deletion a second load would wrongly trigger on a first-ever load (#8026 r26).
+_migrate_picker_written_connection_snapshots(_cfg_cache)
+_cfg_fingerprint = _fingerprint_config(_cfg_cache)
 # The cap api/models.py::_evict_sessions_over_cap() last enforced. That function
 # publishes it after its own fallback and range normalization, so a nonblocking
 # diagnostics read reports what eviction applied without re-entering config or
