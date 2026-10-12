@@ -1869,3 +1869,183 @@ def test_a_raw_record_spelled_with_the_agents_field_names_owns_the_slug(monkeypa
     assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-raw", raw_url), (
         "and the existing route keeps its own endpoint and key"
     )
+
+
+def test_a_generic_record_the_active_model_names_keeps_its_route(monkeypatch):
+    """A generic ``providers['custom']`` record the ACTIVE model names keeps its route.
+
+    The selector's last rung serves the generic record for a slug ``model.provider``
+    names, and the owner scan reserved nothing for it: the same-slug fallback entry was
+    admitted, the exact-row rule then outranked the generic rung, and the chat moved from
+    the record's endpoint and key to the entry's. Master resolved this shape from the
+    generic record, so the record owns the slug before any fallback identity is minted.
+    """
+    u_record = "http://existing.example/v1"
+    u_entry = "http://entry.example/v1"
+    cfg_shape = {
+        "model": {"provider": "custom:晨光", "default": "chat-model"},
+        "providers": {"custom": {"base_url": u_record, "api_key": "sk-existing"}},
+        "custom_providers": [
+            {"name": "晨光", "base_url": u_entry, "api_key": "sk-entry", "model": "chat-model"}
+        ],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert "晨光" in config._custom_provider_identity_owners(
+        cfg_shape["custom_providers"], cfg_shape["providers"], cfg_shape["model"]
+    ), "the generic record the model names owns the slug"
+    assert (
+        config._custom_provider_entry_identity(
+            cfg_shape["custom_providers"][0],
+            cfg_shape["custom_providers"],
+            cfg_shape["providers"],
+            cfg_shape["model"],
+        )
+        == ""
+    ), "so the fallback entry mints nothing over it"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-existing", u_record), (
+        "and the existing route keeps the record's endpoint and key"
+    )
+
+
+def test_a_model_block_owns_every_identity_alias_selection_accepts(monkeypatch):
+    """Both aliases a bare-``custom`` block names are reserved, not only the first.
+
+    ``_custom_record_claims_slug`` accepts ``provider_key`` and ``custom_provider``
+    alike, so a block naming ``custom:晨光`` through the first field still SERVES
+    ``custom:晨曦`` through the second. The owner scan stopped at the first field, so a
+    fallback entry named 晨曦 was admitted and took over a route the model block already
+    served: the send went to the entry's endpoint with the entry's key (HTTP 401 where
+    master completed). Both slugs must be reserved, and ``name`` still names no provider.
+    """
+    u_block = "http://model.example/v1"
+    u_entry = "http://entry.example/v1"
+    cfg_shape = {
+        "model": {
+            "provider": "custom",
+            "provider_key": "custom:晨光",
+            "custom_provider": "custom:晨曦",
+            "default": "chat-model",
+            "base_url": u_block,
+            "api_key": "sk-block",
+        },
+        "custom_providers": [
+            {"name": "晨曦", "base_url": u_entry, "api_key": "sk-entry", "model": "chat-model"}
+        ],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    owners = config._custom_provider_identity_owners(
+        cfg_shape["custom_providers"], None, cfg_shape["model"]
+    )
+    assert {"晨光", "晨曦"} <= owners, "every alias selection accepts is reserved"
+    assert (
+        config._custom_provider_entry_identity(
+            cfg_shape["custom_providers"][0],
+            cfg_shape["custom_providers"],
+            None,
+            cfg_shape["model"],
+        )
+        == ""
+    ), "so the second alias cannot be reassigned to a different record"
+    assert config.resolve_custom_provider_connection("custom:晨曦") == ("sk-block", u_block), (
+        "and the model block keeps serving the slug it already served"
+    )
+
+
+def test_the_model_block_does_not_lend_the_convention_key_to_a_keyless_entry(monkeypatch):
+    """A bare-``custom`` block refuses the shared convention name it does not claim.
+
+    ``custom:晨光`` sanitizes to the shared ``CUSTOM_CUSTOM_API_KEY`` name, so a block
+    that routes there but never CLAIMS that slug would read another provider's variable
+    and send it to the keyless Unicode endpoint. The block must refuse the convention
+    lookup unless it explicitly claims the requested slug.
+    """
+    monkeypatch.setenv("CUSTOM_CUSTOM_API_KEY", "sk-other-provider")
+    u = "http://entry.example/v1"
+    cfg_shape = {
+        "model": {"provider": "custom", "default": "chat-model", "base_url": u},
+        "custom_providers": [{"name": "晨光", "base_url": u, "model": "chat-model"}],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    api_key, base_url = config.resolve_custom_provider_connection("custom:晨光")
+    assert api_key is None, (
+        "another provider's CUSTOM_CUSTOM_API_KEY must not reach this keyless endpoint"
+    )
+    assert base_url == u, "the route still serves the entry's own endpoint"
+    assert not config._custom_provider_record_may_take_convention_key(
+        cfg_shape["model"], "model", cfg_shape, "custom:晨光"
+    ), "the block does not claim the requested slug, so the lookup is refused"
+    assert config._custom_provider_record_may_take_convention_key(
+        dict(cfg_shape["model"], provider_key="custom:晨光"), "model", cfg_shape, "custom:晨光"
+    ), "a block that DOES claim the slug keeps master's lookup"
+
+
+def test_a_model_route_authenticated_by_the_convention_env_var_keeps_its_credential(monkeypatch):
+    """A model route authenticating through ``CUSTOM_<SLUG>_API_KEY`` is not credentialless.
+
+    ``custom:晨光`` sanitizes to that shared name, so a block naming it authenticates
+    through the variable without declaring a credential source of its own. Reading only
+    the declaration treated the route as credentialless, let a same-endpoint entry replace
+    its key, and the send authenticated with the wrong account (HTTP 401 on master's
+    working route). Counting the credential the block actually resolves keeps it the owner.
+    """
+    monkeypatch.setenv("CUSTOM_CUSTOM_API_KEY", "sk-convention")
+    u = "http://existing.example/v1"
+    cfg_shape = {
+        "model": {"provider": "custom:晨光", "default": "chat-model", "base_url": u},
+        "custom_providers": [
+            {"name": "晨光", "base_url": u, "api_key": "sk-entry", "model": "chat-model"}
+        ],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert config._model_block_mirrors_fallback_entry(cfg_shape["model"], "晨光", cfg_shape["custom_providers"]) is False, (
+        "a block with a resolved convention credential is an authority, not the entry's route"
+    )
+    assert "晨光" in config._custom_provider_identity_owners(
+        cfg_shape["custom_providers"], None, cfg_shape["model"]
+    ), "so it owns the slug"
+    api_key, base_url = config.resolve_custom_provider_connection("custom:晨光")
+    assert (api_key, base_url) == ("sk-convention", u), (
+        "and keeps authenticating with the credential it resolves"
+    )
+
+
+def test_set_default_model_keeps_the_entry_endpoint_for_a_key_only_override(monkeypatch, tmp_path):
+    """A key-only ``advanced`` override must not leave the route with no endpoint.
+
+    The Settings panel can send an override key with no URL. For a fallback entry the
+    block declares no endpoint of its own, so persisting the override key alone left the
+    route keyed but endpointless and the next chat failed with
+    ``custom_provider_endpoint_unresolved``. The entry's own URL is what the block was
+    serving, so it is kept.
+    """
+    u = "http://entry.example/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: chat-model\n"
+        "custom_providers:\n"
+        "  - name: 晨光鑫遇专用\n"
+        f"    base_url: {u}\n"
+        "    api_key: sk-entry\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    result = config.set_hermes_default_model(
+        "chat-model", provider="custom:晨光鑫遇专用", advanced={"api_key": "sk-override"}
+    )
+    assert result["ok"] is True
+
+    on_disk = config._load_yaml_config_file(cfg_path)
+    assert on_disk["model"].get("base_url") == u, "the override must not drop the route's endpoint"
+    assert config.resolve_custom_provider_connection("custom:晨光鑫遇专用") == ("sk-override", u), (
+        "the route serves the override key at the endpoint it already served"
+    )

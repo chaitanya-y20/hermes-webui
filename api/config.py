@@ -1615,6 +1615,28 @@ def _custom_provider_identity_owners(
                 if not _provider_record_may_own_slug(record_key, record, key):
                     continue
                 owners.add(key)
+        # The generic ``providers['custom']`` record also serves a slug it does not
+        # name itself, when the ACTIVE ``model.provider`` names that slug: that is the
+        # last rung of the selector's candidate list, and the shape the WebUI itself
+        # writes (``has_generic_custom and named_by_model and not generic_claims_slug``).
+        # Master resolved such a route from this record, so the slug is already owned
+        # and a same-slug fallback entry must not mint an identity over it and move the
+        # chat to its own endpoint and credential (#8164 CORE). Mirrors the selector
+        # exactly: only the slug ``model.provider`` names, only while the record does
+        # not claim it outright (that arm is the loop above), and only while the record
+        # can actually serve the route.
+        generic_record = providers_cfg.get("custom")
+        model_named_slug = _custom_provider_slug_key(
+            model_cfg.get("provider") if isinstance(model_cfg, dict) else None
+        )
+        if (
+            model_named_slug
+            and model_named_slug != "custom"
+            and isinstance(generic_record, dict)
+            and not _custom_record_claims_slug(generic_record, model_named_slug)
+            and _provider_record_may_own_slug("custom", generic_record, model_named_slug)
+        ):
+            owners.add(model_named_slug)
     if isinstance(model_cfg, dict) and model_cfg:
         model_provider = str(model_cfg.get("provider") or "").strip().lower()
         # Which slug does this block claim? A ``custom:<slug>`` provider names it
@@ -1622,33 +1644,38 @@ def _custom_provider_identity_owners(
         # one only through an identity field of its own (``provider_key`` /
         # ``custom_provider``): ``name`` is excluded because a ``model:`` block's
         # ``name`` is the MODEL's name and names no provider (#8026 r14).
-        model_slug = (
-            _custom_provider_slug_key(model_provider) if model_provider.startswith("custom:") else ""
-        )
-        if not model_slug and model_provider == "custom":
-            for _identity_field in _CUSTOM_RECORD_IDENTITY_FIELDS:
-                if _identity_field == "name":
+        # EVERY identity field selection accepts claims its slug, not only the first
+        # one. ``_custom_record_claims_slug`` accepts ``provider_key`` and
+        # ``custom_provider`` alike, so a block naming a different slug through the
+        # first field still SERVES the second: reserving only the first switched that
+        # already-served route to the fallback entry's endpoint and key (#8164 CORE).
+        model_slugs: set[str] = set()
+        if model_provider and model_provider != "custom":
+            model_slugs.add(_custom_provider_slug_key(model_provider))
+        elif model_provider == "custom":
+            for field in _CUSTOM_RECORD_IDENTITY_FIELDS:
+                if field == "name":
                     continue
-                claimed = _custom_provider_slug_key(model_cfg.get(_identity_field))
+                claimed = _custom_provider_slug_key(model_cfg.get(field))
                 if claimed and claimed != "custom":
-                    model_slug = claimed
-                    break
-        # ``enabled`` is checked HERE as well as at selection time. A disabled
-        # record is invisible to the Agent's resolver, so it must not own a route
-        # either: without this, a switched-off ``model:`` block still claimed its
-        # slug and hid a valid same-slug ``custom_providers[]`` entry, leaving the
-        # named route with no connection at all.
-        if (
-            model_slug
-            and _raw_provider_record_enabled(model_cfg)
-            and _custom_record_owns_connection(model_cfg, model_provider)
-            # A ``model:`` block that only SERVES a fallback entry declares no
-            # connection of its own, so it is that entry's route rather than a
-            # separate authority and must not shadow it (#8026). A block with a
-            # connection of its own is the user's route and still counts.
-            and not _model_block_mirrors_fallback_entry(model_cfg, model_slug, custom_providers)
-        ):
-            owners.add(model_slug)
+                    model_slugs.add(claimed)
+        for model_slug in model_slugs:
+            # ``enabled`` is checked HERE as well as at selection time. A disabled
+            # record is invisible to the Agent's resolver, so it must not own a route
+            # either: without this, a switched-off ``model:`` block still claimed its
+            # slug and hid a valid same-slug ``custom_providers[]`` entry, leaving the
+            # named route with no connection at all.
+            if (
+                model_slug
+                and _raw_provider_record_enabled(model_cfg)
+                and _custom_record_owns_connection(model_cfg, model_provider)
+                # A ``model:`` block that only SERVES a fallback entry declares no
+                # connection of its own, so it is that entry's route rather than a
+                # separate authority and must not shadow it (#8026). A block with a
+                # connection of its own is the user's route and still counts.
+                and not _model_block_mirrors_fallback_entry(model_cfg, model_slug, custom_providers)
+            ):
+                owners.add(model_slug)
     return owners
 
 
@@ -1767,9 +1794,16 @@ def _model_block_mirrors_fallback_entry(
     entry_url = str(_custom_record_base_url(entry) or "").rstrip("/")
     if entry_url and block_url and entry_url != block_url:
         return False
-    if _custom_record_declares_credential_source(model_cfg) and _custom_record_declares_credential_source(
-        entry
-    ):
+    # The block may authenticate through the convention ``CUSTOM_<SLUG>_API_KEY`` name
+    # without DECLARING a credential source of its own (``custom:晨光`` sanitizes to
+    # that shared name). Reading only the declaration treated such a route as
+    # credentialless, so a same-endpoint entry was free to replace its key and the
+    # send 401'd where master completed (#8164 CORE). Count the credential the block
+    # actually RESOLVES before demoting its ownership.
+    model_has_key = _custom_record_declares_credential_source(model_cfg) or bool(
+        block_url and _lookup_custom_api_key_env(f"custom:{key}")
+    )
+    if model_has_key and _custom_record_declares_credential_source(entry):
         return False
     return True
 
@@ -2127,6 +2161,7 @@ def _custom_provider_record_may_take_convention_key(
     record: object,
     source: object = None,
     cfg_data: object = None,
+    provider_hint: object = None,
 ) -> bool:
     """May this custom-provider RECORD read the ``CUSTOM_<SLUG>_API_KEY`` name?
 
@@ -2149,6 +2184,24 @@ def _custom_provider_record_may_take_convention_key(
     authenticates today.
     """
     if str(source or "") == "model":
+        # A bare-``custom`` block that does not CLAIM the requested fallback slug
+        # routes there anyway when nothing else serves it, and ``custom:<non-ASCII>``
+        # sanitizes to the shared ``CUSTOM_CUSTOM_API_KEY`` name: another provider's
+        # variable then travels to the keyless Unicode endpoint (#8164 CORE). The
+        # requested provider id is what says which slug the lookup is FOR.
+        slug = _custom_provider_slug_key(provider_hint)
+        if (
+            isinstance(record, dict)
+            and str(record.get("provider") or "").strip().lower() == "custom"
+            and isinstance(cfg_data, dict)
+            and any(
+                _custom_provider_slug_is_fallback(entry.get("name"))
+                and _custom_provider_slug_key(entry.get("name")) == slug
+                for entry in _custom_provider_entries(cfg_data)
+            )
+            and not _custom_record_claims_slug(record, slug, allow_name=False)
+        ):
+            return False
         # Only a MIRROR is refused: the block is that fallback entry's route rather
         # than a separate authority. A ``model:`` route at its own endpoint, or
         # one naming an ASCII/prefixed provider, keeps master's lookup.
@@ -4594,7 +4647,7 @@ def resolve_custom_provider_connection(
         record.get("api_key"),
         record.get("key_env"),
         pid,
-        allow_convention_key=_custom_provider_record_may_take_convention_key(record, source, cfg_data),
+        allow_convention_key=_custom_provider_record_may_take_convention_key(record, source, cfg_data, pid),
     )
     if return_provenance:
         return api_key, base_url, is_exact
@@ -4945,7 +4998,7 @@ def resolve_custom_provider_bundle(
             record.get("api_key"),
             record.get("key_env"),
             pid,
-            allow_convention_key=_custom_provider_record_may_take_convention_key(record, source, cfg_data),
+            allow_convention_key=_custom_provider_record_may_take_convention_key(record, source, cfg_data, pid),
         )
     if not api_key:
         api_key = _host_gated_env_key(base_url)
@@ -7236,6 +7289,19 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
                 model_cfg.pop(_cred_field, None)
 
         _apply_advanced_model_options(model_cfg, advanced)
+        # An explicit key with no URL of its own leaves the route with no endpoint,
+        # and the next chat fails. The selected fallback entry's URL is what the block
+        # was serving before the override, so keep it rather than persisting a
+        # key-only block (#8164 CORE).
+        if (
+            selected_fallback_entry is not None
+            and isinstance(advanced, dict)
+            and str(advanced.get("api_key") or "").strip()
+            and "base_url" not in advanced
+            and not model_cfg.get("base_url")
+            and selected_fallback_entry.get("base_url")
+        ):
+            model_cfg["base_url"] = str(selected_fallback_entry["base_url"]).strip().rstrip("/")
         if not _main_model_supports_service_tier(persisted_model, persisted_provider):
             model_cfg.pop("service_tier", None)
 

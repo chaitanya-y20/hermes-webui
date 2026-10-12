@@ -1055,7 +1055,16 @@ endpoint. Two rules:
   `providers:<key>` record that spells its endpoint `api` / `url` or its credential
   `api_key_env` (`_normalized_raw_provider_record`) reserves its slug the same way a
   record spelled `base_url` / `key_env` does, instead of leaving the slug free for a
-  same-slug fallback entry to mint over it. The one
+  same-slug fallback entry to mint over it. The generic `providers['custom']` record
+  owns the one slug the ACTIVE `model.provider` names, the selector's last rung and
+  the shape the WebUI itself writes: without that reservation the fallback entry
+  outranked the generic rung and the chat moved off the record's endpoint and key. A
+  `model:` block reserves EVERY slug it names through any identity field
+  (`provider_key`, `custom_provider`), not only the first, because selection accepts
+  them all; and a block that authenticates through the resolved
+  `CUSTOM_<SLUG>_API_KEY` counts as credential-owning although it declares no
+  credential source, so a same-endpoint entry cannot take over a credential the
+  route already uses. The one
   exception is the slug's own keyed route `providers["custom:<slug>"]`, which keeps
   reserving its slug even when switched off, because selection answers that route with
   a terminal `missing` rather than falling through to another record.
