@@ -1056,15 +1056,22 @@ endpoint. Two rules:
   `api_key_env` (`_normalized_raw_provider_record`) reserves its slug the same way a
   record spelled `base_url` / `key_env` does, instead of leaving the slug free for a
   same-slug fallback entry to mint over it. The generic `providers['custom']` record
-  owns the one slug the ACTIVE `model.provider` names, the selector's last rung and
-  the shape the WebUI itself writes: without that reservation the fallback entry
-  outranked the generic rung and the chat moved off the record's endpoint and key. A
+  reserves NOTHING merely because the ACTIVE `model.provider` names a slug: that tie is
+  the selector's LAST rung, reached only when nothing names the slug outright, and
+  neither the WebUI nor the agent writes such a record, so one beside the entry the
+  picker has just selected is left over from a previous route or a hand edit. Reserving
+  it there let the stale record outrank the fresh pick, the entry minted nothing and
+  vanished from the picker while the chat kept the old endpoint and key. An explicitly
+  named entry wins over the generic record, which is what master already does for an
+  ASCII name, so the fallback identity follows the same rule. The record still owns the
+  slug its own key or display name spells. A
   `model:` block reserves EVERY slug it names through any identity field
   (`provider_key`, `custom_provider`), not only the first, because selection accepts
   them all; and a block that authenticates through the resolved
-  `CUSTOM_<SLUG>_API_KEY` counts as credential-owning although it declares no
-  credential source, so a same-endpoint entry cannot take over a credential the
-  route already uses. The one
+  `CUSTOM_<SLUG>_API_KEY`, or through the host-paired credential the runtime accepts for
+  its endpoint (`OPENAI_BASE_URL` / `OPENAI_API_KEY`), counts as credential-owning
+  although it declares no credential source, so a same-endpoint entry cannot take over a
+  credential the route already uses. The one
   exception is the slug's own keyed route `providers["custom:<slug>"]`, which keeps
   reserving its slug even when switched off, because selection answers that route with
   a terminal `missing` rather than falling through to another record.
@@ -1109,8 +1116,18 @@ sanitizes to the constant `CUSTOM` and so would otherwise read a variable that
 belongs to another provider. An id cannot carry that distinction on its own: the
 id `custom:晨光` is the same whether the user typed it or the fallback minted it,
 and an ASCII id such as `custom:_` sanitizes to that same constant while being a
-variable nobody else shares. A `model:` block that only serves a fallback entry,
-declaring no connection of its own, is refused on the same terms.
+variable nobody else shares. A `model:` block that only serves a fallback entry is
+refused on the same terms, and "only serves" covers the block the Save RETAINS: the
+picker keeps the endpoint the block already served, so the block it leaves behind can be
+a bare URL that repeats a keyless entry's own and holds no credential of its own, which
+looks exactly like a user-authored named route. Reading the block as an authority there
+handed the route another provider's `CUSTOM_CUSTOM_API_KEY` (every Unicode id sanitizes
+to that one name) the moment the picker rewrote `model.provider` to the entry's id. A
+block that supplies the endpoint the entry does NOT declare, or that sits beside an entry
+holding its own credential, is an authority of its own and keeps master's lookup. The
+Save path also treats a BLANK `advanced.base_url` (what the Settings panel posts when the
+field is empty, rather than omitting the key) as "no URL of my own", so a key-only save
+keeps the selected entry's endpoint instead of persisting a keyed block with none.
 
 ---
 

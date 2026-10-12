@@ -1871,16 +1871,22 @@ def test_a_raw_record_spelled_with_the_agents_field_names_owns_the_slug(monkeypa
     )
 
 
-def test_a_generic_record_the_active_model_names_keeps_its_route(monkeypatch):
-    """A generic ``providers['custom']`` record the ACTIVE model names keeps its route.
+def test_an_explicitly_picked_entry_wins_over_a_generic_record(monkeypatch):
+    """An entry the model names owns its slug; a generic record does not shadow it.
 
-    The selector's last rung serves the generic record for a slug ``model.provider``
-    names, and the owner scan reserved nothing for it: the same-slug fallback entry was
-    admitted, the exact-row rule then outranked the generic rung, and the chat moved from
-    the record's endpoint and key to the entry's. Master resolved this shape from the
-    generic record, so the record owns the slug before any fallback identity is minted.
+    A generic ``providers['custom']`` record is the selector's LAST rung, reached only
+    when nothing names the slug outright, and neither ``api/`` nor the Agent writes one:
+    a generic record beside the entry the picker just selected comes from a previous
+    route or a hand edit. Reserving the slug for it made the fallback entry mint nothing,
+    the exact-row rule then outranked the generic rung, and the freshly picked entry
+    vanished from the picker while the chat kept the OLD record's endpoint and key
+    (greptile r34 P1, maintainer SHOULD-FIX: take the ASCII parity master already has,
+    where an explicitly named entry wins over the generic record).
+
+    The control keeps the deletion honest: with NO same-slug entry, the generic record
+    the active model names is still what serves the route.
     """
-    u_record = "http://existing.example/v1"
+    u_record = "http://old.example/v1"
     u_entry = "http://entry.example/v1"
     cfg_shape = {
         "model": {"provider": "custom:晨光", "default": "chat-model"},
@@ -1891,9 +1897,9 @@ def test_a_generic_record_the_active_model_names_keeps_its_route(monkeypatch):
     }
     _install_cfg_shape(monkeypatch, cfg_shape)
 
-    assert "晨光" in config._custom_provider_identity_owners(
+    assert "晨光" not in config._custom_provider_identity_owners(
         cfg_shape["custom_providers"], cfg_shape["providers"], cfg_shape["model"]
-    ), "the generic record the model names owns the slug"
+    ), "a generic record named only by the active model does not reserve the slug"
     assert (
         config._custom_provider_entry_identity(
             cfg_shape["custom_providers"][0],
@@ -1901,10 +1907,69 @@ def test_a_generic_record_the_active_model_names_keeps_its_route(monkeypatch):
             cfg_shape["providers"],
             cfg_shape["model"],
         )
-        == ""
-    ), "so the fallback entry mints nothing over it"
+        == "custom:晨光"
+    ), "so the entry the user picked mints its identity"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-entry", u_entry), (
+        "and the route serves the picked entry, not the leftover generic record"
+    )
+
+    no_entry = dict(cfg_shape, custom_providers=[])
+    _install_cfg_shape(monkeypatch, no_entry)
     assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-existing", u_record), (
-        "and the existing route keeps the record's endpoint and key"
+        "control: the selector's last rung still serves a generic record nothing else claims"
+    )
+
+
+def test_a_save_keeps_the_picked_entry_over_an_old_generic_record(monkeypatch, tmp_path):
+    """A save-and-reload of the picker's selection must not hand the route to a record.
+
+    Greptile's r34 P1, with its own shape: ``model.provider: custom`` served by an old
+    ``providers['custom']`` connection must not survive the Save rewriting the provider
+    to the entry's id. The entry stays the route's authority across the reload, and it
+    must still be listed.
+    """
+    u_old = "http://old.example/v1"
+    u_entry = "http://entry.example/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: chat-model\n"
+        f"  base_url: {u_entry}\n"
+        "providers:\n"
+        "  custom:\n"
+        f"    base_url: {u_old}\n"
+        "    api_key: sk-old\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {u_entry}\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+    monkeypatch.delenv("CUSTOM_CUSTOM_API_KEY", raising=False)
+
+    _load(cfg_path)
+    assert config.resolve_custom_provider_connection("custom:晨光") == (None, u_entry), (
+        "the entry owns the route before the save"
+    )
+
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    on_disk = _load(cfg_path)
+
+    assert on_disk["model"]["provider"] == "custom:晨光", "the picker persisted the selection"
+    assert (
+        config._custom_provider_entry_identity(
+            on_disk["custom_providers"][0],
+            on_disk["custom_providers"],
+            on_disk.get("providers"),
+            on_disk["model"],
+        )
+        == "custom:晨光"
+    ), "and the entry still owns its identity after the reload, so the picker lists it"
+    assert config.resolve_custom_provider_connection("custom:晨光") == (None, u_entry), (
+        "the reloaded route keeps the entry, not the old generic record's endpoint and key"
     )
 
 
@@ -2048,4 +2113,173 @@ def test_set_default_model_keeps_the_entry_endpoint_for_a_key_only_override(monk
     assert on_disk["model"].get("base_url") == u, "the override must not drop the route's endpoint"
     assert config.resolve_custom_provider_connection("custom:晨光鑫遇专用") == ("sk-override", u), (
         "the route serves the override key at the endpoint it already served"
+    )
+
+
+def test_a_saved_block_repeating_the_entrys_endpoint_reads_no_shared_key(monkeypatch):
+    """A block that adds nothing the entry lacks is that entry's route, not a key holder.
+
+    The Save keeps the endpoint of a fallback entry the block already served, so the
+    block it leaves behind is a bare URL that repeats the entry's own and holds no
+    credential: it looks exactly like a user-authored named route, and the convention
+    lookup handed it another provider's ``CUSTOM_CUSTOM_API_KEY`` (both Unicode ids
+    sanitize to that one name). The refusal must therefore reach this shape too, and the
+    two shapes around it must keep master's lookup (#8164 r34 MUST-FIX).
+    """
+    monkeypatch.setenv("CUSTOM_CUSTOM_API_KEY", "sk-other")
+    u = "http://entry.example/v1"
+    cfg_shape = {
+        "model": {"provider": "custom:晨光", "default": "chat-model", "base_url": u},
+        "custom_providers": [{"name": "晨光", "base_url": u, "model": "chat-model"}],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert config._model_block_is_the_pickers_route(
+        cfg_shape["model"], "custom:晨光", cfg_shape["custom_providers"]
+    ), "the retained block repeats the keyless entry's own endpoint"
+    assert not config._custom_provider_record_may_take_convention_key(
+        cfg_shape["model"], "model", cfg_shape, "custom:晨光"
+    ), "so it refuses the shared convention name"
+    assert config.resolve_custom_provider_connection("custom:晨光") == (None, u), (
+        "another provider's CUSTOM_CUSTOM_API_KEY must not reach this keyless route"
+    )
+
+    endpointless_entry = {
+        "model": {"provider": "custom:晨光", "default": "chat-model", "base_url": u},
+        "custom_providers": [{"name": "晨光"}],
+    }
+    _install_cfg_shape(monkeypatch, endpointless_entry)
+    assert config._custom_provider_record_may_take_convention_key(
+        endpointless_entry["model"], "model", endpointless_entry, "custom:晨光"
+    ), "control: the entry declares no endpoint, so the block supplies it and keeps the lookup"
+
+    credentialed_entry = {
+        "model": {"provider": "custom:晨光", "default": "chat-model", "base_url": u},
+        "custom_providers": [{"name": "晨光", "base_url": u, "api_key": "sk-entry"}],
+    }
+    _install_cfg_shape(monkeypatch, credentialed_entry)
+    assert config._custom_provider_record_may_take_convention_key(
+        credentialed_entry["model"], "model", credentialed_entry, "custom:晨光"
+    ), "control: the entry holds its own credential, so the block stays its own authority"
+
+
+def test_a_host_authenticated_block_is_not_demoted_by_a_same_endpoint_entry(monkeypatch):
+    """A block authenticated from the host's environment is not credentialless.
+
+    ``_model_block_mirrors_fallback_entry`` counted only a DECLARED source and the
+    convention variable, so a block resolving the host-paired ``OPENAI_API_KEY`` read as
+    credentialless and a same-endpoint entry took the route over: the send went out with
+    the entry's ``key_cmd`` token where master sent the host-paired key (r34 MUST-FIX).
+    """
+    u = "http://127.0.0.1:18119/v1"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-skHOST")
+    monkeypatch.setenv("OPENAI_BASE_URL", u)
+    cfg_shape = {
+        "model": {"provider": "custom:晨光", "default": "chat-model", "base_url": u},
+        "custom_providers": [
+            {
+                "name": "晨光",
+                "base_url": u,
+                "model": "chat-model",
+                "key_cmd": "printf test-skCOMMAND",
+            }
+        ],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert config._host_gated_env_key(u) == "test-skHOST", (
+        "the runtime accepts the host-paired key for this endpoint"
+    )
+    assert (
+        config._model_block_mirrors_fallback_entry(
+            cfg_shape["model"], "custom:晨光", cfg_shape["custom_providers"]
+        )
+        is False
+    ), "so the block is an authority, not the entry's route"
+    assert "晨光" in config._custom_provider_identity_owners(
+        cfg_shape["custom_providers"], None, cfg_shape["model"]
+    ), "and it owns the slug"
+    bundle = config.resolve_custom_provider_bundle("custom:晨光")
+    assert bundle["api_key"] == "test-skHOST", "the send authenticates with the host-paired key"
+    assert bundle["base_url"] == u
+
+
+def test_a_block_naming_the_bare_slug_keeps_an_endpointless_entrys_connection(monkeypatch):
+    """The bare slug spelling the candidate list accepts must reach the Save-path rule.
+
+    A hand-written block may name its provider ``晨光`` rather than ``custom:晨光``, and
+    the candidate list already treats that spelling as ``named_by_model``. The Save-path
+    preference block compared the provider against ``{custom, pid}`` alone, so an
+    endpointless entry handed the route to itself and the restored session failed with
+    ``provider_unroutable`` where master completed (greptile r34 MUST-FIX).
+    """
+    u = "http://entry.example/v1"
+    cfg_shape = {
+        "model": {
+            "provider": "晨光",
+            "default": "chat-model",
+            "base_url": u,
+            "api_key": "test-skA",
+        },
+        "custom_providers": [{"name": "晨光", "model": "chat-model"}],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    _record, source, _is_exact, status = config._select_custom_provider_record(
+        "custom:晨光", "晨光", cfg_shape
+    )
+    assert source == "model", "the block's connection is what the endpointless entry inherits"
+    assert status == config.CUSTOM_SELECTION_KEYED
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("test-skA", u), (
+        "the restored session authenticates exactly as master's did"
+    )
+
+
+def test_the_settings_panel_payload_keeps_the_entry_endpoint(monkeypatch, tmp_path):
+    """The panel POSTs ``base_url: ""`` rather than omitting the key.
+
+    ``_apply_advanced_model_options`` pops the endpoint for a blank URL, and the fallback
+    that restores the entry's own URL tested for the KEY's absence: a key-only save from
+    the Settings panel therefore persisted a keyed block with no endpoint, and the next
+    chat failed with ``custom_provider_endpoint_unresolved`` (greptile r34 MUST-FIX).
+    """
+    u = "http://entry.example/v1"
+    u_other = "http://other.example/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: chat-model\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {u}\n"
+        "    api_key: sk-entry\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    result = config.set_hermes_default_model(
+        "chat-model",
+        provider="custom:晨光",
+        advanced={"api_key": "sk-override", "base_url": ""},
+    )
+    assert result["ok"] is True
+
+    on_disk = config._load_yaml_config_file(cfg_path)
+    assert on_disk["model"].get("base_url") == u, "a blank panel URL must not drop the endpoint"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-override", u), (
+        "the route serves the override key at the endpoint it already served"
+    )
+
+    config.set_hermes_default_model(
+        "chat-model",
+        provider="custom:晨光",
+        advanced={"api_key": "sk-override", "base_url": u_other},
+    )
+    on_disk = config._load_yaml_config_file(cfg_path)
+    assert on_disk["model"].get("base_url") == u_other, (
+        "control: an explicit non-blank URL override still wins"
     )
