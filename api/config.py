@@ -1497,6 +1497,18 @@ def _provider_record_may_own_slug(record_key: object, record: object, slug: str)
     falling through to another record, so it keeps reserving the slug whether or not
     it is enabled. An enabled one still has to declare a connection, because that
     shape does fall through.
+
+    Each record is judged in the SPELLING selection judges it in. The raw
+    ``providers:<key>`` rung is the one candidate selection respells first
+    (:func:`_normalized_raw_provider_record` in
+    :func:`_unique_raw_provider_record`), because a raw record may spell its
+    endpoint ``api`` / ``url`` or its credential ``api_key_env``. Judged as
+    written, such a record declared no connection here, reserved no slug, and the
+    same-slug fallback entry minted the identity OVER the record the resolver
+    already served, re-pointing the existing route at the entry's endpoint and key
+    (#8164 greptile P1). The keyed ``custom:<slug>`` record, the generic ``custom``
+    record and a ``model:`` block are judged as written, exactly as the chokepoint
+    at the end of :func:`_select_custom_provider_record` judges them.
     """
     key = str(record_key or "").strip()
     if (
@@ -1509,6 +1521,8 @@ def _provider_record_may_own_slug(record_key: object, record: object, slug: str)
         return False
     if not _raw_provider_record_enabled(record):
         return False
+    if key.lower() not in {f"custom:{slug}", "custom"}:
+        record = _normalized_raw_provider_record(record, key)
     return _custom_record_owns_connection(record, f"custom:{slug}")
 
 

@@ -1822,3 +1822,50 @@ def test_control_a_providers_record_the_selector_can_serve_still_owns_the_slug(m
         assert config.resolve_custom_provider_connection("custom:晨光") == expected, (
             f"{providers!r} must resolve from its own record"
         )
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"api": "http://raw.example/v1", "api_key_env": "RAW_KEY"},
+        {"url": "http://raw.example/v1", "api_key_env": "RAW_KEY"},
+    ],
+    ids=["api", "url"],
+)
+def test_a_raw_record_spelled_with_the_agents_field_names_owns_the_slug(monkeypatch, record):
+    """A raw record selection RESPELLS declares its connection in either vocabulary.
+
+    ``_unique_raw_provider_record`` runs a raw ``providers:<key>`` record through
+    ``_normalized_raw_provider_record`` before judging a connection, because the
+    raw shape may spell its endpoint ``api`` / ``url`` and its credential
+    ``api_key_env`` (``_entry_url``'s precedence in the installed Agent). The owners
+    scan judged the record as written, so such a record declared no connection,
+    reserved no slug, and the same-slug fallback entry minted the identity OVER the
+    record the resolver already served: the existing route's endpoint and key were
+    replaced by the entry's (greptile #8164 P1).
+    """
+    monkeypatch.setenv("RAW_KEY", "sk-raw")
+    u = "http://entry.example/v1"
+    raw_url = "http://raw.example/v1"
+    cfg_shape = {
+        "model": {"provider": "custom:晨光", "default": "chat-model"},
+        "custom_providers": [{"name": "晨光", "base_url": u, "api_key": "sk-entry"}],
+        "providers": {"晨光": dict(record)},
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert "晨光" in config._custom_provider_identity_owners(
+        cfg_shape["custom_providers"], cfg_shape["providers"], cfg_shape["model"]
+    ), "the record selection respells is servable and owns the slug"
+    assert (
+        config._custom_provider_entry_identity(
+            cfg_shape["custom_providers"][0],
+            cfg_shape["custom_providers"],
+            cfg_shape["providers"],
+            cfg_shape["model"],
+        )
+        == ""
+    ), "so the fallback entry mints nothing over it"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-raw", raw_url), (
+        "and the existing route keeps its own endpoint and key"
+    )

@@ -1050,7 +1050,12 @@ endpoint. Two rules:
   (`_provider_record_may_own_slug`): non-empty, `enabled`, and declaring a connection
   field, the three checks `_select_custom_provider_record` applies to every candidate.
   An empty or switched-off `providers:` record still reserved its slug, which hid a
-  complete fallback entry and left the named route with no endpoint at all. The one
+  complete fallback entry and left the named route with no endpoint at all. Each
+  record is judged in the SPELLING selection judges it in, so a raw
+  `providers:<key>` record that spells its endpoint `api` / `url` or its credential
+  `api_key_env` (`_normalized_raw_provider_record`) reserves its slug the same way a
+  record spelled `base_url` / `key_env` does, instead of leaving the slug free for a
+  same-slug fallback entry to mint over it. The one
   exception is the slug's own keyed route `providers["custom:<slug>"]`, which keeps
   reserving its slug even when switched off, because selection answers that route with
   a terminal `missing` rather than falling through to another record.
