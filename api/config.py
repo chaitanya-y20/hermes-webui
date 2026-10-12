@@ -1474,6 +1474,44 @@ def _custom_provider_slug_is_fallback(name: object) -> bool:
     return not _ascii_provider_slug(raw) and bool(_non_ascii_fallback_slug(raw))
 
 
+def _provider_record_may_own_slug(record_key: object, record: object, slug: str) -> bool:
+    """True when selection could actually serve ``slug`` from this ``providers:`` record.
+
+    The owners scan must reserve a slug only for a record
+    :func:`_select_custom_provider_record` can serve. Reserving one for a record the
+    selector never returns shadows the fallback entry AND leaves the route with
+    nothing, because an owner the selector cannot reach has no serving record behind
+    it (#8026 r20).
+
+    Selection applies three checks to every candidate (the record is NON-EMPTY,
+    ``enabled``, and declares a connection field) through the single chokepoint at
+    the end of :func:`_select_custom_provider_record`, and the raw scan skips an
+    empty record before it ever reaches it. A raw record that skips them still
+    reserved its slug here: ``providers: {"晨光": {}}`` beside a complete fallback
+    entry named ``晨光`` hid the entry and left ``custom:晨光`` with no endpoint at
+    all (#8164 greptile P1).
+
+    One deliberate exception: the slug's OWN keyed route,
+    ``providers['custom:<slug>']``. Switching that record off is a statement about
+    THIS route, and selection answers it with a terminal ``missing`` rather than
+    falling through to another record, so it keeps reserving the slug whether or not
+    it is enabled. An enabled one still has to declare a connection, because that
+    shape does fall through.
+    """
+    key = str(record_key or "").strip()
+    if (
+        key.lower() == f"custom:{slug}"
+        and isinstance(record, dict)
+        and not _raw_provider_record_enabled(record)
+    ):
+        return True
+    if not (isinstance(record, dict) and record):
+        return False
+    if not _raw_provider_record_enabled(record):
+        return False
+    return _custom_record_owns_connection(record, f"custom:{slug}")
+
+
 def _custom_provider_identity_owners(
     custom_providers: object = None,
     providers_cfg: object = None,
@@ -1555,8 +1593,14 @@ def _custom_provider_identity_owners(
                 if not str(value or "").strip():
                     continue
                 key = _custom_provider_slug_key(value)
-                if key:
-                    owners.add(key)
+                if not key:
+                    continue
+                # Reserve the slug only for a record selection can actually serve:
+                # an owner the selector cannot reach hides the fallback entry AND
+                # leaves the route with no serving record at all (#8164 greptile P1).
+                if not _provider_record_may_own_slug(record_key, record, key):
+                    continue
+                owners.add(key)
     if isinstance(model_cfg, dict) and model_cfg:
         model_provider = str(model_cfg.get("provider") or "").strip().lower()
         # Which slug does this block claim? A ``custom:<slug>`` provider names it
@@ -7117,11 +7161,15 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
             _model_block_serves_selected_custom_provider(persisted_provider, previous_config_data)
         )
 
-        selected_fallback_entry = (
-            _selected_fallback_entry(persisted_provider, config_data)
-            if persisted_provider != previous_provider
-            else None
-        )
+        # Whether the selected provider names a fallback-derived entry is asked on
+        # EVERY save, not only when the provider changes. A second Save of the same
+        # picker selection is not a provider change, and gating this on one let that
+        # save fall through to the connection copy below: the block then declared a
+        # connection of its own and became eligible for the shared
+        # ``CUSTOM_<SLUG>_API_KEY`` the entry itself is denied, so a variable
+        # belonging to another provider travelled to this entry's endpoint
+        # (#8164 greptile P1).
+        selected_fallback_entry = _selected_fallback_entry(persisted_provider, config_data)
 
         model_cfg["default"] = persisted_model
         if persisted_provider:
@@ -7151,11 +7199,6 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
                 # endpoint at all.
                 model_cfg.pop("base_url", None)
 
-        selected_fallback_entry = (
-            _selected_fallback_entry(persisted_provider, config_data)
-            if persisted_provider != previous_provider
-            else None
-        )
         # The block now serves a fallback entry it did not serve before the click, so
         # whatever credential source it still carries was minted for the route it just
         # left. The picker rewrites ``model.provider`` but leaves the block's own key in

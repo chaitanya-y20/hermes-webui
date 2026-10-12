@@ -1046,6 +1046,14 @@ endpoint. Two rules:
   Counting its other identity fields claimed a route the selector could never serve:
   the fallback entry was shadowed and no record served the slug at all, so both the
   catalog group and the named route disappeared.
+  A record also reserves a slug only while selection could actually serve it
+  (`_provider_record_may_own_slug`): non-empty, `enabled`, and declaring a connection
+  field, the three checks `_select_custom_provider_record` applies to every candidate.
+  An empty or switched-off `providers:` record still reserved its slug, which hid a
+  complete fallback entry and left the named route with no endpoint at all. The one
+  exception is the slug's own keyed route `providers["custom:<slug>"]`, which keeps
+  reserving its slug even when switched off, because selection answers that route with
+  a terminal `missing` rather than falling through to another record.
   A config holding both `custom:晨光` and `晨光` (or a `providers: {"custom:晨光":
   ...}` record plus a legacy `晨光` list entry) keeps resolving the record it
   always did: the legacy name owns `晨光`, so the fallback entry mints nothing
@@ -1056,8 +1064,9 @@ endpoint. Two rules:
   counts only when it owns a real connection, and does NOT count while it is the
   route OF the entry rather than an authority of its own
   (`_model_block_mirrors_fallback_entry`). The Save path no longer copies a
-  fallback entry's connection onto the `model:` block, so the block it leaves
-  behind declares no connection of its own and the entry keeps the identity, the
+  fallback entry's connection onto the `model:` block, on ANY save including a
+  repeat save of the same selection, so the block it leaves behind declares no
+  connection of its own and the entry keeps the identity, the
   endpoint and the credential: counting the block hid the entry the moment it was
   selected, and the next send used the keyless placeholder (401 against an
   authenticated endpoint). A block that declares a connection at a DIFFERENT

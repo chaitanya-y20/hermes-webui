@@ -140,6 +140,12 @@ def _load(cfg_path):
     return loaded
 
 
+def _install_cfg_shape(monkeypatch, cfg_shape):
+    """Point both config views at an in-memory shape, the way the catalog tests do."""
+    monkeypatch.setattr(config, "cfg", dict(cfg_shape))
+    monkeypatch.setattr(config, "get_config", lambda: dict(cfg_shape))
+
+
 @pytest.fixture(autouse=True)
 def _restore_shared_config():
     """Undo the picker tests' in-place mutation of the shared ``config.cfg``.
@@ -1684,3 +1690,135 @@ def test_the_block_the_picker_writes_reads_no_shared_key(monkeypatch):
     assert api_key is None, (
         "a keyless fallback entry must not pick up the shared convention variable"
     )
+
+
+def test_a_repeated_save_does_not_copy_the_connection_onto_the_block(monkeypatch, tmp_path):
+    """A second Save of the SAME picker selection must not copy the entry connection.
+
+    The provider does not change on that save, so the fallback-entry question was
+    never asked and the connection copy below it ran: the block ended up declaring an
+    endpoint of its own, ``_model_block_is_the_pickers_route`` stopped recognising it
+    as the picker's route, and the block became eligible for the shared
+    ``CUSTOM_CUSTOM_API_KEY`` that the entry itself is denied. A variable belonging to
+    the bare ``custom`` provider then travelled to this entry's endpoint (greptile
+    #8164 P1).
+    """
+    monkeypatch.setenv("CUSTOM_CUSTOM_API_KEY", "sk-other")
+    U = "http://entry.example/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: chat-model\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {U}\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    assert config.resolve_custom_provider_connection("custom:晨光") == (None, U)
+
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    _load(cfg_path)
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    _load(cfg_path)
+
+    on_disk = config._load_yaml_config_file(cfg_path)
+    assert "base_url" not in on_disk["model"], (
+        "the repeat save wrote the entry's resolved URL onto the block"
+    )
+    api_key, base_url = config.resolve_custom_provider_connection("custom:晨光")
+    assert (api_key, base_url) == (None, U), (
+        "the bare custom provider's key must not reach this entry's endpoint"
+    )
+
+
+@pytest.mark.parametrize(
+    "providers",
+    [
+        {"晨光": {}},
+        {"晨光": {"enabled": False, "base_url": "http://other.example/v1", "api_key": "sk-other"}},
+        {
+            "custom": {
+                "enabled": False,
+                "provider_key": "晨光",
+                "base_url": "http://other.example/v1",
+                "api_key": "sk-other",
+            }
+        },
+        {"custom:晨光": {}},
+    ],
+    ids=["empty-raw", "disabled-raw", "disabled-generic", "empty-keyed"],
+)
+def test_a_providers_record_the_selector_cannot_serve_does_not_own_the_slug(monkeypatch, providers):
+    """An owner the selector never returns hides the entry AND leaves the route empty.
+
+    Selection applies three checks to every candidate (non-empty, ``enabled``,
+    declares a connection field), and the raw scan skips an empty record outright.
+    Reserving the slug for a record that fails them shadowed the complete fallback
+    entry and left ``custom:晨光`` with no endpoint at all, while the entry that could
+    serve it sat in the list (greptile #8164 P1).
+    """
+    u = "http://entry.example/v1"
+    cfg_shape = {
+        "model": {"provider": "custom:晨光", "default": "chat-model"},
+        "custom_providers": [{"name": "晨光", "base_url": u, "api_key": "sk-entry"}],
+        "providers": providers,
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert config._custom_provider_identity_owners(
+        cfg_shape["custom_providers"], providers, cfg_shape["model"]
+    ) == set(), "a record the selector cannot serve owns nothing"
+    assert (
+        config._custom_provider_entry_identity(
+            cfg_shape["custom_providers"][0],
+            cfg_shape["custom_providers"],
+            providers,
+            cfg_shape["model"],
+        )
+        == "custom:晨光"
+    ), "so the complete entry is admitted instead of hidden"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-entry", u), (
+        "and the route is served by that entry rather than nothing"
+    )
+
+
+def test_control_a_providers_record_the_selector_can_serve_still_owns_the_slug(monkeypatch):
+    """CONTROLS: the gate must narrow only the records selection cannot serve.
+
+    An enabled record that declares a connection is what the record is FOR, and the
+    slug's own keyed route keeps reserving its slug even when switched off, because
+    selection answers that route with a terminal ``missing`` rather than falling
+    through (#8026 r20, r20 vocabulary rule).
+    """
+    u = "http://entry.example/v1"
+    shapes = [
+        ({"晨光": {"base_url": "http://raw.example/v1", "api_key": "sk-raw"}}, ("sk-raw", "http://raw.example/v1")),
+        (
+            {"custom:晨光": {"base_url": "http://keyed.example/v1", "api_key": "sk-keyed"}},
+            ("sk-keyed", "http://keyed.example/v1"),
+        ),
+        (
+            {"custom:晨光": {"enabled": False, "base_url": "http://off.example/v1", "api_key": "sk-off"}},
+            (None, None),
+        ),
+    ]
+    for providers, expected in shapes:
+        cfg_shape = {
+            "model": {"provider": "custom:晨光", "default": "chat-model"},
+            "custom_providers": [{"name": "晨光", "base_url": u, "api_key": "sk-entry"}],
+            "providers": providers,
+        }
+        _install_cfg_shape(monkeypatch, cfg_shape)
+
+        assert "晨光" in config._custom_provider_identity_owners(
+            cfg_shape["custom_providers"], providers, cfg_shape["model"]
+        ), f"{providers!r} is servable and must keep owning the slug"
+        assert config.resolve_custom_provider_connection("custom:晨光") == expected, (
+            f"{providers!r} must resolve from its own record"
+        )
