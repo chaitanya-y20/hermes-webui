@@ -1009,6 +1009,86 @@ Default toolset list (hardcoded fallback):
 The web UI always runs with the full CLI toolset. There is no per-session toolset
 restriction from the UI yet (see ROADMAP.md Wave 4 for the plan).
 
+### 8.1 Custom provider identity (slug)
+
+A `custom_providers[]` entry is keyed by a slug minted from its `name`. That slug
+is the identity handed to the agent (`custom:<slug>`) and the id the model picker
+emits for the entry, so the two must agree or selecting a model does not reach its
+endpoint. Two rules:
+
+- **A name with ASCII identifier characters** (`[a-z0-9._-]`) is slugified by
+  `_custom_provider_slug_from_name()`: lowercase, every run of other characters
+  folded to `-`, so `Proxy Main` -> `custom:proxy-main` and `Foo (Bar)` ->
+  `custom:foo-bar`. A name that has any of those characters is slugified this
+  way even when some of them are stripped in the process. `_` and `.` ARE
+  identifier characters, so `_` -> `custom:_` and `.` -> `custom:.`.
+- **A name with none of them** (e.g. a pure-CJK name such as `晨光鑫遇专用`)
+  keeps its own characters, because the agent's `custom_provider_slug()` does
+  (`_agent_custom_provider_slug` mirrors it). Folding them away emptied the slug,
+  and an empty slug is read as "no provider", so the whole entry vanished from
+  the picker while the CLI kept using it (#8017). The fallback reproduces the
+  agent vocabulary character for character, so a name whose spaces would
+  normalize differently still resolves to the id the agent minted for it. The
+  one exception is `:`: the qualified-model hint is `@custom:<name>:<model>`, and
+  a name carrying one gives that string a segment the parser cannot attribute,
+  so the endpoint vanishes and sending fails. A name with a `:` therefore takes
+  the ASCII fold, and for a name whose fold is empty that is no identity at all:
+  `晨光:鑫遇` mints nothing and stays uncatalogued, exactly as it does today.
+  Nothing that routes before stops routing; the name simply is not advertised.
+  The fallback also requires the name to carry a non-ASCII character: an
+  all-ASCII name reaches it exactly when its fold was empty (`-`, `()`), and
+  those minted nothing before either, so their behaviour is unchanged.
+- **Existing owners come first.** A fallback-derived identity is admitted only
+  when no pre-existing entry, `providers:` record or connection-owning `model:`
+  block already owns that slug. A `providers:` record other than the generic
+  `providers['custom']` owns one only through its own config key or its display
+  `name`, the pair the selector matches that record by (`_unique_raw_provider_record`).
+  Counting its other identity fields claimed a route the selector could never serve:
+  the fallback entry was shadowed and no record served the slug at all, so both the
+  catalog group and the named route disappeared.
+  A config holding both `custom:晨光` and `晨光` (or a `providers: {"custom:晨光":
+  ...}` record plus a legacy `晨光` list entry) keeps resolving the record it
+  always did: the legacy name owns `晨光`, so the fallback entry mints nothing
+  and is excluded from routing, catalog ownership and collision detection
+  (`_unique_custom_provider_entry`). Without this, the new identity would turn a
+  working config into `AmbiguousCustomProviderError` and silently re-point an
+  existing keyed route at the other entry's endpoint and key. The `model:` arm
+  counts only when it owns a real connection, and does NOT count while it is the
+  route OF the entry rather than an authority of its own
+  (`_model_block_mirrors_fallback_entry`). The Save path no longer copies a
+  fallback entry's connection onto the `model:` block, so the block it leaves
+  behind declares no connection of its own and the entry keeps the identity, the
+  endpoint and the credential: counting the block hid the entry the moment it was
+  selected, and the next send used the keyless placeholder (401 against an
+  authenticated endpoint). A block that declares a connection at a DIFFERENT
+  endpoint is an authority of its own and the entry stays shadowed behind it.
+  Endpoint equality is evidence only while at least one side declares no
+  credential: two credentialed records at one URL can be two accounts, and URL
+  equality cannot say which account a request should use, so a block with its own
+  credential is never demoted behind a credentialed entry.
+
+The connection a named route resolves and the slug it routes under are separate
+answers. An EXACT fallback entry that declares no credential of its own and either
+shares the configured model connection's endpoint or declares none keeps that
+connection (`model.base_url` and `key_env`): before #8017 the entry minted nothing,
+so `model:` served its declared model, and the exact-row rule returning the bare
+entry instead sent `dummy-key` (401) or left the route
+`custom_provider_endpoint_unresolved`.
+
+The fallback is name-derived, not endpoint-derived: two providers sharing one
+`base_url` are two identities and must stay two entries. The same rule governs
+the API-key env var, and it is decided per RECORD rather than per id:
+`_api_key_env_name()` keeps master's whole-id rule (so `custom:foo` and
+`custom:custom_foo` stay distinct), while
+`_custom_provider_record_may_take_convention_key()` refuses the shared
+`CUSTOM_<SLUG>_API_KEY` lookup for a newly admitted fallback entry, whose id
+sanitizes to the constant `CUSTOM` and so would otherwise read a variable that
+belongs to another provider. An id cannot carry that distinction on its own: the
+id `custom:晨光` is the same whether the user typed it or the fallback minted it,
+and an ASCII id such as `custom:_` sanitizes to that same constant while being a
+variable nobody else shares. A `model:` block that only serves a fallback entry,
+declaring no connection of its own, is refused on the same terms.
+
 ---
 
 ## 9. Known Bugs and Technical Debt Summary
