@@ -1526,6 +1526,66 @@ def _provider_record_may_own_slug(record_key: object, record: object, slug: str)
     return _custom_record_owns_connection(record, f"custom:{slug}")
 
 
+CUSTOM_PROVIDER_SELECTION_FIELD = "custom_provider_selection"
+
+
+def _recorded_custom_provider_selection(model_cfg: object) -> dict:
+    """The picker's recorded entry selection on this ``model:`` block, or ``{}``.
+
+    ``set_hermes_default_model`` writes :data:`CUSTOM_PROVIDER_SELECTION_FIELD` when the
+    provider it persists names a fallback-derived ``custom_providers[]`` entry: the entry
+    the user picked, and the endpoint that entry declared at pick time. Nothing else in
+    the project writes it, so its presence is the one fact that separates a route the
+    picker has just selected from an EXISTING configuration that merely happens to hold
+    both a same-slug fallback entry and a generic ``providers['custom']`` record (#8164
+    r36 MUST-FIX).
+
+    A malformed value reads as no record at all. The exemption it grants keeps a slug away
+    from the record that would otherwise own it, so it is honoured only when the record
+    says everything it has to say: an object naming a provider.
+    """
+    if not isinstance(model_cfg, dict):
+        return {}
+    record = model_cfg.get(CUSTOM_PROVIDER_SELECTION_FIELD)
+    if not isinstance(record, dict):
+        return {}
+    provider = str(record.get("provider") or "").strip()
+    if not provider:
+        return {}
+    return {"provider": provider, "base_url": str(record.get("base_url") or "").strip()}
+
+
+def _recorded_selection_covers_entry(
+    model_cfg: object,
+    entry: object,
+    provider: object,
+) -> bool:
+    """True when the recorded picker selection names this very entry and endpoint.
+
+    Both halves of the record are load-bearing, and together they scope the exemption to
+    ONE route. The PROVIDER half pins it to the provider the Save persisted, so a block
+    since re-pointed at another provider no longer matches. The ENDPOINT half pins it to
+    the connection the user picked, so an entry whose own endpoint has been edited since
+    the pick stops matching and the configuration returns to master's rule instead of
+    keeping an exemption granted to a connection that no longer exists. An entry that
+    declares NO endpoint of its own records an empty one and matches another empty one,
+    which is the shape the picker writes for a keyless entry (#8164 r36 MUST-FIX).
+    """
+    if not isinstance(entry, dict):
+        return False
+    record = _recorded_custom_provider_selection(model_cfg)
+    if not record:
+        return False
+    # The record holds the provider ID the Save persisted (``custom:<slug>``); compare it
+    # through the ONE slug producer both spellings share, so ``custom:晨光`` and a bare
+    # ``晨光`` are the same route here as they are everywhere else.
+    if _custom_provider_slug_key(record["provider"]) != _custom_provider_slug_key(provider):
+        return False
+    recorded_url = _normalize_base_url_for_match(record["base_url"])
+    entry_url = _normalize_base_url_for_match(_custom_record_base_url(entry))
+    return recorded_url == entry_url
+
+
 def _custom_provider_identity_owners(
     custom_providers: object = None,
     providers_cfg: object = None,
@@ -1569,14 +1629,16 @@ def _custom_provider_identity_owners(
     claims a slug only through those two and never through its other identity fields
     (#8026 r20).
 
-    A generic ``providers['custom']`` record owns NOTHING merely because the active
-    ``model.provider`` names a slug: that is a provenance tie the selector applies only
-    as its LAST rung, after every record that names the slug outright, and reserving the
-    slug here would let a stale generic record left over from a previous route outrank an
-    entry the user has just picked. Master routes an ASCII name this way (an explicitly
-    named entry wins over the generic record), so the fallback identity follows the same
-    rule (greptile r34, SHOULD-FIX). The record's own key or display name still owns its
-    slug through the loop above.
+    A generic ``providers['custom']`` record owns the slug the ACTIVE ``model.provider``
+    names, through the selector's LAST rung (``has_generic_custom and named_by_model and
+    not generic_claims_slug``). That is a provenance tie rather than a declaration, and
+    master resolved such a route from that record, so for an EXISTING configuration it has
+    to keep doing so: the alternative moves a route nobody touched to a same-slug fallback
+    entry's endpoint and credential the moment the WebUI is upgraded (#8164 r36 MUST-FIX).
+    The ONE exception is the entry the picker's Save recorded on the block
+    (:func:`_recorded_selection_covers_entry`): there the user chose that entry over the
+    record, so the record does not reserve the slug and the entry mints its identity. The
+    record's own key or display name still owns its slug through the loop above.
     """
     owners: set[str] = set()
     if isinstance(custom_providers, list):
@@ -1624,6 +1686,37 @@ def _custom_provider_identity_owners(
                 if not _provider_record_may_own_slug(record_key, record, key):
                     continue
                 owners.add(key)
+        # The generic ``providers['custom']`` record also serves a slug it does not name
+        # itself, when the ACTIVE ``model.provider`` names that slug: that is the last rung
+        # of the selector's candidate list, and the shape the WebUI itself writes
+        # (``has_generic_custom and named_by_model and not generic_claims_slug``). Master
+        # resolved such a route from this record, so the slug is already owned and a
+        # same-slug fallback entry must not mint an identity over it and move the chat to
+        # its own endpoint and credential (#8164 CORE, r36 MUST-FIX). Mirrors the selector
+        # exactly: only the slug ``model.provider`` names, only while the record does not
+        # claim it outright (that arm is the loop above), and only while the record can
+        # actually serve the route.
+        #
+        # The ONE exception is the entry the picker's Save recorded: there the user chose
+        # that entry over this record, and master's rule would send the click straight back
+        # to the route it just left (#8164 r36).
+        generic_record = providers_cfg.get("custom")
+        model_named_slug = _custom_provider_slug_key(
+            model_cfg.get("provider") if isinstance(model_cfg, dict) else None
+        )
+        if (
+            model_named_slug
+            and model_named_slug != "custom"
+            and isinstance(generic_record, dict)
+            and not _custom_record_claims_slug(generic_record, model_named_slug)
+            and _provider_record_may_own_slug("custom", generic_record, model_named_slug)
+            and not _recorded_selection_covers_entry(
+                model_cfg,
+                _fallback_entry_named_by_block(model_cfg, model_named_slug, custom_providers),
+                model_named_slug,
+            )
+        ):
+            owners.add(model_named_slug)
     if isinstance(model_cfg, dict) and model_cfg:
         model_provider = str(model_cfg.get("provider") or "").strip().lower()
         # Which slug does this block claim? A ``custom:<slug>`` provider names it
@@ -1760,8 +1853,8 @@ def _model_block_is_the_pickers_route(
         return False
     if _custom_record_declares_credential_source(entry):
         return False
-    block_url = str(_custom_record_base_url(model_cfg) or "").rstrip("/")
-    entry_url = str(_custom_record_base_url(entry) or "").rstrip("/")
+    block_url = _normalize_base_url_for_match(_custom_record_base_url(model_cfg))
+    entry_url = _normalize_base_url_for_match(_custom_record_base_url(entry))
     return bool(block_url) and block_url == entry_url
 
 
@@ -1806,7 +1899,18 @@ def _model_block_mirrors_fallback_entry(
         return False
     block_url = str(_custom_record_base_url(model_cfg) or "").rstrip("/")
     entry_url = str(_custom_record_base_url(entry) or "").rstrip("/")
-    if entry_url and block_url and entry_url != block_url:
+    # Same-route means the same endpoint, decided the way SELECTION decides it
+    # (``_normalize_base_url_for_match``): a block at ``http://ENTRY.example/v1`` beside a
+    # keyless entry at ``http://entry.example/v1`` is one route to the selector, so it has
+    # to be one route to the refusal too, or the block reads as a separate authority and
+    # reaches for the shared ``CUSTOM_<SLUG>_API_KEY`` (maintainer r36 SHOULD-FIX). The raw
+    # spelling is kept for the host-gated lookup below, which asks the runtime about THIS
+    # endpoint string.
+    if (
+        entry_url
+        and block_url
+        and _normalize_base_url_for_match(entry_url) != _normalize_base_url_for_match(block_url)
+    ):
         return False
     # The block may authenticate through the convention ``CUSTOM_<SLUG>_API_KEY`` name
     # without DECLARING a credential source of its own (``custom:晨光`` sanitizes to
@@ -7292,6 +7396,22 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
         model_cfg["default"] = persisted_model
         if persisted_provider:
             model_cfg["provider"] = persisted_provider
+
+        # Record the entry this Save selected, so the ownership scan can tell a route the
+        # user has just picked from an EXISTING configuration that merely holds both a
+        # same-slug fallback entry and a generic ``providers['custom']`` record, where master
+        # keeps serving the record (#8164 r36 MUST-FIX). Scoped to the provider persisted
+        # here and the endpoint the entry declares, and dropped as soon as a Save persists a
+        # provider naming no fallback entry, so the record can never outlive the selection it
+        # describes. A Save that names no fallback entry clears any stale record: the route
+        # it left behind is no longer this block's.
+        if selected_fallback_entry is not None:
+            model_cfg[CUSTOM_PROVIDER_SELECTION_FIELD] = {
+                "provider": persisted_provider,
+                "base_url": str(_custom_record_base_url(selected_fallback_entry) or "").strip(),
+            }
+        else:
+            model_cfg.pop(CUSTOM_PROVIDER_SELECTION_FIELD, None)
 
         # A fallback entry's connection is NOT copied onto the block (#8026). The
         # entry keeps its own identity, and a block that declares no connection is

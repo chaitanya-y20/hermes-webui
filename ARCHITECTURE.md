@@ -1056,14 +1056,17 @@ endpoint. Two rules:
   `api_key_env` (`_normalized_raw_provider_record`) reserves its slug the same way a
   record spelled `base_url` / `key_env` does, instead of leaving the slug free for a
   same-slug fallback entry to mint over it. The generic `providers['custom']` record
-  reserves NOTHING merely because the ACTIVE `model.provider` names a slug: that tie is
-  the selector's LAST rung, reached only when nothing names the slug outright, and
-  neither the WebUI nor the agent writes such a record, so one beside the entry the
-  picker has just selected is left over from a previous route or a hand edit. Reserving
-  it there let the stale record outrank the fresh pick, the entry minted nothing and
-  vanished from the picker while the chat kept the old endpoint and key. An explicitly
-  named entry wins over the generic record, which is what master already does for an
-  ASCII name, so the fallback identity follows the same rule. The record still owns the
+  reserves the slug the ACTIVE `model.provider` names, through the selector's last rung:
+  master resolved such a route from that record, so an EXISTING configuration keeps its
+  endpoint and account instead of moving, on upgrade, to a same-slug fallback entry's
+  (maintainer MUST-FIX, r36). The one exception is the entry the picker's Save recorded:
+  `set_hermes_default_model` writes `model.custom_provider_selection` = the provider it
+  persisted plus the endpoint that entry declared, and while both still match
+  (`_recorded_selection_covers_entry`) the record reserves nothing and the picked entry
+  mints its identity, so the click is not sent back to the route it just left. The record
+  is scoped to that one route: another provider, an entry whose own endpoint has been
+  edited since, or no same-slug entry at all leaves the record owning the slug, and a Save
+  naming no fallback entry drops the record. The record still owns the
   slug its own key or display name spells. A
   `model:` block reserves EVERY slug it names through any identity field
   (`provider_key`, `custom_provider`), not only the first, because selection accepts
@@ -1122,7 +1125,14 @@ picker keeps the endpoint the block already served, so the block it leaves behin
 a bare URL that repeats a keyless entry's own and holds no credential of its own, which
 looks exactly like a user-authored named route. Reading the block as an authority there
 handed the route another provider's `CUSTOM_CUSTOM_API_KEY` (every Unicode id sanitizes
-to that one name) the moment the picker rewrote `model.provider` to the entry's id. A
+to that one name) the moment the picker rewrote `model.provider` to the entry's id. That
+one shared name is also why a **non-ASCII-named custom provider must declare its own
+credential** on its `custom_providers[]` entry, through `api_key`, `key_env`, `key_cmd` or
+a pool: every Unicode slug sanitizes to the same variable, so reading it is how one
+provider's key reached another's endpoint. Such a route now resolves exactly as the
+agent's own named-custom resolver does (entry key, then `key_env`, then a host-gated
+credential), and a setup that relied on the shared variable fails closed with an
+authentication error instead of sending another provider's key. A
 block that supplies the endpoint the entry does NOT declare, or that sits beside an entry
 holding its own credential, is an authority of its own and keeps master's lookup. The
 Save path also treats a BLANK `advanced.base_url` (what the Settings panel posts when the

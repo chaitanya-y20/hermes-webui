@@ -1871,20 +1871,19 @@ def test_a_raw_record_spelled_with_the_agents_field_names_owns_the_slug(monkeypa
     )
 
 
-def test_an_explicitly_picked_entry_wins_over_a_generic_record(monkeypatch):
-    """An entry the model names owns its slug; a generic record does not shadow it.
+def test_an_unmarked_existing_route_keeps_the_generic_records_ownership(monkeypatch):
+    """An EXISTING configuration keeps master's rule: the generic record owns the slug.
 
     A generic ``providers['custom']`` record is the selector's LAST rung, reached only
-    when nothing names the slug outright, and neither ``api/`` nor the Agent writes one:
-    a generic record beside the entry the picker just selected comes from a previous
-    route or a hand edit. Reserving the slug for it made the fallback entry mint nothing,
-    the exact-row rule then outranked the generic rung, and the freshly picked entry
-    vanished from the picker while the chat kept the OLD record's endpoint and key
-    (greptile r34 P1, maintainer SHOULD-FIX: take the ASCII parity master already has,
-    where an explicitly named entry wins over the generic record).
+    when nothing names the slug outright, and master resolved this shape from it: the
+    same-slug fallback entry minted no identity there. Admitting one on upgrade moved a
+    route nobody touched to the entry's endpoint and account, so the send went to the
+    entry's URL with the entry's key where master completed at the record's
+    (maintainer r36 MUST-FIX).
 
-    The control keeps the deletion honest: with NO same-slug entry, the generic record
-    the active model names is still what serves the route.
+    The CONTROL is the same shape carrying the picker's RECORDED selection: there the user
+    chose that entry over the record, so the record reserves nothing and the entry keeps
+    its own endpoint and account.
     """
     u_record = "http://old.example/v1"
     u_entry = "http://entry.example/v1"
@@ -1897,9 +1896,9 @@ def test_an_explicitly_picked_entry_wins_over_a_generic_record(monkeypatch):
     }
     _install_cfg_shape(monkeypatch, cfg_shape)
 
-    assert "晨光" not in config._custom_provider_identity_owners(
+    assert "晨光" in config._custom_provider_identity_owners(
         cfg_shape["custom_providers"], cfg_shape["providers"], cfg_shape["model"]
-    ), "a generic record named only by the active model does not reserve the slug"
+    ), "the record the active model names owns the slug"
     assert (
         config._custom_provider_entry_identity(
             cfg_shape["custom_providers"][0],
@@ -1907,17 +1906,153 @@ def test_an_explicitly_picked_entry_wins_over_a_generic_record(monkeypatch):
             cfg_shape["providers"],
             cfg_shape["model"],
         )
-        == "custom:晨光"
-    ), "so the entry the user picked mints its identity"
-    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-entry", u_entry), (
-        "and the route serves the picked entry, not the leftover generic record"
+        == ""
+    ), "so the fallback entry mints nothing over it"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-existing", u_record), (
+        "and the route stays exactly where master left it"
     )
 
-    no_entry = dict(cfg_shape, custom_providers=[])
-    _install_cfg_shape(monkeypatch, no_entry)
-    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-existing", u_record), (
-        "control: the selector's last rung still serves a generic record nothing else claims"
+    recorded = dict(cfg_shape)
+    recorded["model"] = dict(
+        cfg_shape["model"],
+        custom_provider_selection={"provider": "custom:晨光", "base_url": u_entry},
     )
+    _install_cfg_shape(monkeypatch, recorded)
+    assert "晨光" not in config._custom_provider_identity_owners(
+        recorded["custom_providers"], recorded["providers"], recorded["model"]
+    ), "control: the picker's recorded selection does not reserve the slug"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-entry", u_entry), (
+        "so the entry the user picked is served from its own connection"
+    )
+
+
+def test_the_recorded_selection_is_scoped_to_the_provider_and_endpoint_it_names(monkeypatch):
+    """The exemption covers ONE route: another provider, or another endpoint, keeps the record.
+
+    Both halves of the record are load-bearing. A block since re-pointed at a different
+    provider, and an entry whose own endpoint has been edited since the pick, must fall
+    back to master's rule rather than inherit an exemption granted to a route that is gone
+    (maintainer r36: "provider/endpoint-scoped").
+    """
+    u_record = "http://old.example/v1"
+    u_entry = "http://entry.example/v1"
+    base = {
+        "model": {"provider": "custom:晨光", "default": "chat-model"},
+        "providers": {"custom": {"base_url": u_record, "api_key": "sk-existing"}},
+        "custom_providers": [
+            {"name": "晨光", "base_url": u_entry, "api_key": "sk-entry", "model": "chat-model"}
+        ],
+    }
+
+    other_endpoint = dict(base)
+    other_endpoint["model"] = dict(
+        base["model"],
+        custom_provider_selection={"provider": "custom:晨光", "base_url": u_record},
+    )
+    _install_cfg_shape(monkeypatch, other_endpoint)
+    assert "晨光" in config._custom_provider_identity_owners(
+        other_endpoint["custom_providers"], other_endpoint["providers"], other_endpoint["model"]
+    ), "a record for a different endpoint does not cover this entry's"
+
+    other_provider = dict(base)
+    other_provider["model"] = dict(
+        base["model"],
+        custom_provider_selection={"provider": "custom:晨曦", "base_url": u_entry},
+    )
+    _install_cfg_shape(monkeypatch, other_provider)
+    assert "晨光" in config._custom_provider_identity_owners(
+        other_provider["custom_providers"], other_provider["providers"], other_provider["model"]
+    ), "a record for a different provider does not cover this route"
+
+    entryless = dict(base)
+    entryless["model"] = dict(
+        base["model"],
+        custom_provider_selection={"provider": "custom:晨光", "base_url": u_entry},
+    )
+    entryless["custom_providers"] = []
+    _install_cfg_shape(monkeypatch, entryless)
+    assert "晨光" in config._custom_provider_identity_owners(
+        entryless["custom_providers"], entryless["providers"], entryless["model"]
+    ), "and with no entry to serve, the record still owns the slug"
+
+
+def test_a_save_records_the_selection_and_only_for_the_entry_it_picked(monkeypatch, tmp_path):
+    """The Save records the picked entry, and clears the record on a provider it no longer picks.
+
+    The record is what tells a route the user just selected apart from an existing
+    configuration, so it must be written for a fallback entry's pick and dropped as soon
+    as a Save persists a provider that names no fallback entry (maintainer r36).
+    """
+    u_entry = "http://entry.example/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: chat-model\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {u_entry}\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    on_disk = _load(cfg_path)
+
+    assert on_disk["model"][config.CUSTOM_PROVIDER_SELECTION_FIELD] == {
+        "provider": "custom:晨光",
+        "base_url": u_entry,
+    }, "the Save records which entry it picked, and the endpoint that entry declares"
+
+    config.set_hermes_default_model("chat-model", provider="openai")
+    cleared = _load(cfg_path)
+    assert config.CUSTOM_PROVIDER_SELECTION_FIELD not in cleared["model"], (
+        "a Save naming no fallback entry drops the selection it no longer makes"
+    )
+
+
+def test_a_same_endpoint_block_is_one_route_however_the_spelling_differs(monkeypatch):
+    """The same-endpoint refusal and SELECTION must agree on endpoint equality.
+
+    Selection compares endpoints through ``_normalize_base_url_for_match``, while the
+    refusal compared raw ``rstrip("/")`` strings. A block at ``http://ENTRY.example/v1``
+    beside a keyless entry at ``http://entry.example/v1`` is ONE route to the selector and
+    TWO to the refusal, so the block read as an authority of its own and reached for the
+    shared ``CUSTOM_<SLUG>_API_KEY`` of a provider it never named (maintainer r36
+    SHOULD-FIX). The block's raw spelling is still what the host-gated lookup asks the
+    runtime about, and a genuinely different endpoint stays a separate authority.
+    """
+    monkeypatch.setenv("CUSTOM_CUSTOM_API_KEY", "sk-other")
+    u_entry = "http://entry.example/v1"
+    cfg_shape = {
+        "model": {
+            "provider": "custom:晨光",
+            "default": "chat-model",
+            "base_url": "http://ENTRY.example/v1",
+        },
+        "custom_providers": [{"name": "晨光", "base_url": u_entry, "model": "chat-model"}],
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert config._model_block_is_the_pickers_route(
+        cfg_shape["model"], "custom:晨光", cfg_shape["custom_providers"]
+    ), "the two spellings are one endpoint to the selector"
+    assert not config._custom_provider_record_may_take_convention_key(
+        cfg_shape["model"], "model", cfg_shape, "custom:晨光"
+    ), "so the refusal reaches them too"
+
+    elsewhere = dict(cfg_shape)
+    elsewhere["model"] = dict(cfg_shape["model"], base_url="http://other.example/v1")
+    _install_cfg_shape(monkeypatch, elsewhere)
+    assert not config._model_block_is_the_pickers_route(
+        elsewhere["model"], "custom:晨光", elsewhere["custom_providers"]
+    ), "control: a block at another endpoint is an authority of its own"
+    assert config._custom_provider_record_may_take_convention_key(
+        elsewhere["model"], "model", elsewhere, "custom:晨光"
+    ), "so it keeps master's lookup"
 
 
 def test_a_save_keeps_the_picked_entry_over_an_old_generic_record(monkeypatch, tmp_path):
@@ -2174,6 +2309,30 @@ def test_a_host_authenticated_block_is_not_demoted_by_a_same_endpoint_entry(monk
     u = "http://127.0.0.1:18119/v1"
     monkeypatch.setenv("OPENAI_API_KEY", "test-skHOST")
     monkeypatch.setenv("OPENAI_BASE_URL", u)
+    # The tests workflow installs pip packages only, so the agent package this helper would
+    # import is ABSENT there and the pairing answered "no host credential", which is how
+    # this test came back red on CI while passing wherever the agent is importable. Stub
+    # the runtime helper through ``sys.modules`` the way the issue-1806 test does, so the
+    # assertion tests this module's handling of the pairing, not what happens to be
+    # installed (maintainer r36 MUST-FIX).
+    asked: list[str] = []
+
+    def _stub_candidates(base_url, *, ollama):
+        asked.append(str(base_url or ""))
+        return ["test-skHOST" if str(base_url or "").rstrip("/") == u else ""]
+
+    fake_runtime_provider = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_provider._host_gated_env_key_candidates = _stub_candidates
+    # Both entries, with the submodule hung off the fake parent as an ATTRIBUTE: an
+    # ``import hermes_cli.runtime_provider as x`` resolves the attribute first, so a
+    # sys.modules entry alone is bypassed wherever the real package is importable, and the
+    # test would then assert the installed agent's answer instead of this module's handling
+    # of it (the shape the issue-1013 handoff tests use).
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.__path__ = []
+    fake_hermes_cli.runtime_provider = fake_runtime_provider
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_provider)
     cfg_shape = {
         "model": {"provider": "custom:晨光", "default": "chat-model", "base_url": u},
         "custom_providers": [
@@ -2189,6 +2348,9 @@ def test_a_host_authenticated_block_is_not_demoted_by_a_same_endpoint_entry(monk
 
     assert config._host_gated_env_key(u) == "test-skHOST", (
         "the runtime accepts the host-paired key for this endpoint"
+    )
+    assert asked and set(asked) == {u}, (
+        "the stub answered, and only for the endpoint under test, so no agent install is required"
     )
     assert (
         config._model_block_mirrors_fallback_entry(
