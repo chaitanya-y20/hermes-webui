@@ -1677,6 +1677,15 @@ def _custom_provider_identity_owners(
             for value in values:
                 if not str(value or "").strip():
                     continue
+                # A bare value that only reaches a slug through the non-ASCII fallback is an
+                # identity this change MINTS; master matched nothing there, so it must not
+                # read as a pre-existing claim that outranks the model block. The record's
+                # own key, and any ``custom:``-prefixed or ASCII identifier, are untouched.
+                if (
+                    str(record_key or "").strip().lower() == "custom"
+                    and _custom_provider_slug_is_fallback(value)
+                ):
+                    continue
                 key = _custom_provider_slug_key(value)
                 if not key:
                     continue
@@ -1735,6 +1744,10 @@ def _custom_provider_identity_owners(
         elif model_provider == "custom":
             for field in _CUSTOM_RECORD_IDENTITY_FIELDS:
                 if field == "name":
+                    continue
+                # Same rule as the record scan: a bare fallback value names no slug this
+                # block owned before the fallback existed (#8164 r37 MUST-FIX).
+                if _custom_provider_slug_is_fallback(model_cfg.get(field)):
                     continue
                 claimed = _custom_provider_slug_key(model_cfg.get(field))
                 if claimed and claimed != "custom":
@@ -4289,6 +4302,11 @@ def _custom_record_claims_slug(record: object, slug: str, *, allow_name: bool = 
             continue
         value = record.get(field)
         if not isinstance(value, str) or not value.strip():
+            continue
+        # A bare fallback value only reaches this slug through an identity this change
+        # MINTS. Master matched nothing for it, so it may not read as a claim that
+        # outranks an existing route (#8164 r37 MUST-FIX).
+        if _custom_provider_slug_is_fallback(value):
             continue
         if _custom_provider_slug_key(value) == slug:
             return True
@@ -7415,7 +7433,18 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
         # record at G, a same-slug entry at E) resolves to G before the save, and writing the
         # entry's own endpoint here handed the slug to the entry on reload, so the next chat
         # requested E with the entry's key where the route had been G (#8164 greptile P1).
-        if persisted_provider != previous_provider:
+        #
+        # Two SPELLINGS of one provider are one provider here, exactly as they are to the
+        # selector: the panel posts the bare name where the block already holds
+        # ``custom:<name>``, so a raw string comparison read an options-only Save as a pick
+        # and recorded a selection nobody made (#8164 r37 MUST-FIX).
+        def _selection_identity(value):
+            normalized = str(value or "").strip().lower()
+            if _custom_provider_slug_is_fallback(normalized):
+                return _custom_provider_slug_from_name(normalized)
+            return normalized
+
+        if _selection_identity(persisted_provider) != _selection_identity(previous_provider):
             if selected_fallback_entry is not None:
                 model_cfg[CUSTOM_PROVIDER_SELECTION_FIELD] = {
                     "provider": persisted_provider,

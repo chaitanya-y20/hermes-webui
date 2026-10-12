@@ -2591,3 +2591,104 @@ def test_a_key_only_save_keeps_the_endpoint_the_route_serves(monkeypatch, tmp_pa
     assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-override", u_route), (
         "the override key serves at the endpoint the route was already on"
     )
+
+
+def test_a_records_bare_fallback_name_is_not_a_claim_over_the_model_block(monkeypatch):
+    """A bare fallback value claims nothing: master matched no slug for it either.
+
+    ``providers['custom']`` reads its identity fields only through
+    ``_custom_record_claims_slug``, and this change is what makes a bare non-ASCII value
+    in one of them produce a slug at all. An EXISTING config whose block already owns
+    ``custom:晨光`` (its own endpoint and key) therefore had the record jump AHEAD of the
+    block in the candidate list, and the next turn went to the record's endpoint with the
+    record's key (maintainer r37 MUST-FIX, both repros through the real server).
+    Excluding ONLY the fallback-derived values leaves every pre-existing spelling claiming
+    what it always claimed: the CONTROL below names the slug through ``provider_key`` and
+    still outranks the block, exactly as on master.
+    """
+    u_block = "http://m.example/v1"
+    u_record = "http://g.example/v1"
+    cfg_shape = {
+        "model": {
+            "provider": "custom:晨光",
+            "default": "chat-model",
+            "base_url": u_block,
+            "api_key": "test-skMODEL",
+        },
+        "providers": {"custom": {"name": "晨光", "base_url": u_record, "api_key": "test-skGENERIC"}},
+    }
+    _install_cfg_shape(monkeypatch, cfg_shape)
+
+    assert not config._custom_record_claims_slug(cfg_shape["providers"]["custom"], "晨光"), (
+        "a bare fallback name names no slug this config owned before the fallback existed"
+    )
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("test-skMODEL", u_block), (
+        "so the block the user wrote stays this route's authority, as on master"
+    )
+
+    named = dict(cfg_shape)
+    named["providers"] = {
+        "custom": {"provider_key": "custom:晨光", "base_url": u_record, "api_key": "test-skGENERIC"}
+    }
+    _install_cfg_shape(monkeypatch, named)
+    assert config._custom_record_claims_slug(named["providers"]["custom"], "晨光"), (
+        "control: a spelling that named the slug before this change still claims it"
+    )
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("test-skGENERIC", u_record), (
+        "and still outranks the block, as it does on master"
+    )
+
+
+def test_an_options_only_save_that_only_respells_the_provider_records_nothing(monkeypatch, tmp_path):
+    """Two spellings of one provider are one provider to the Save predicate too.
+
+    The Settings panel posts the bare name where the block already holds ``custom:<name>``;
+    compared as raw strings that reads as a provider CHANGE, so the Save recorded a
+    selection for a same-slug entry the user never picked, and the entry took the route on
+    reload (maintainer r37 MUST-FIX). The CONTROL is a Save that names a genuinely
+    different provider, which still records the entry it moved to.
+    """
+    u_record = "http://g.example/v1"
+    u_entry = "http://e.example/v1"
+    body = (
+        "model:\n"
+        "  provider: {provider}\n"
+        "  default: chat-model\n"
+        "providers:\n"
+        "  custom:\n"
+        f"    base_url: {u_record}\n"
+        "    api_key: test-skOLD\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {u_entry}\n"
+        "    api_key: test-skENTRY\n"
+        "    model: chat-model\n"
+    )
+    cfg_path = _write_cfg(tmp_path, body.format(provider="晨光"))
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("test-skOLD", u_record), (
+        "the record serves the route before the save"
+    )
+
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    on_disk = _load(cfg_path)
+
+    assert config.CUSTOM_PROVIDER_SELECTION_FIELD not in on_disk["model"], (
+        "an options-only Save selects nothing, so it records nothing"
+    )
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("test-skOLD", u_record), (
+        "and the route stays exactly where master left it"
+    )
+
+    moved = _write_cfg(tmp_path, body.format(provider="custom"))
+    _load(moved)
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    moved_disk = _load(moved)
+    assert moved_disk["model"][config.CUSTOM_PROVIDER_SELECTION_FIELD] == {
+        "provider": "custom:晨光",
+        "base_url": u_entry,
+    }, "control: a Save that moved the route still records the entry it moved to"
