@@ -7405,13 +7405,24 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
         # provider naming no fallback entry, so the record can never outlive the selection it
         # describes. A Save that names no fallback entry clears any stale record: the route
         # it left behind is no longer this block's.
-        if selected_fallback_entry is not None:
-            model_cfg[CUSTOM_PROVIDER_SELECTION_FIELD] = {
-                "provider": persisted_provider,
-                "base_url": str(_custom_record_base_url(selected_fallback_entry) or "").strip(),
-            }
-        else:
-            model_cfg.pop(CUSTOM_PROVIDER_SELECTION_FIELD, None)
+        #
+        # ONLY a Save that MOVED the route records one, because that is what selecting means:
+        # ``persisted_provider`` differs from the provider the block was already on. A Save
+        # that keeps the provider it found is an options-only save (the Settings panel posts
+        # the current provider with a temperature or a model id), and it selects nothing. It
+        # must then preserve the connection the route already has, which is the record: an
+        # existing config (`model.provider: custom:晨光`, a generic ``providers['custom']``
+        # record at G, a same-slug entry at E) resolves to G before the save, and writing the
+        # entry's own endpoint here handed the slug to the entry on reload, so the next chat
+        # requested E with the entry's key where the route had been G (#8164 greptile P1).
+        if persisted_provider != previous_provider:
+            if selected_fallback_entry is not None:
+                model_cfg[CUSTOM_PROVIDER_SELECTION_FIELD] = {
+                    "provider": persisted_provider,
+                    "base_url": str(_custom_record_base_url(selected_fallback_entry) or "").strip(),
+                }
+            else:
+                model_cfg.pop(CUSTOM_PROVIDER_SELECTION_FIELD, None)
 
         # A fallback entry's connection is NOT copied onto the block (#8026). The
         # entry keeps its own identity, and a block that declares no connection is

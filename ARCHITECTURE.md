@@ -1063,7 +1063,13 @@ endpoint. Two rules:
   `set_hermes_default_model` writes `model.custom_provider_selection` = the provider it
   persisted plus the endpoint that entry declared, and while both still match
   (`_recorded_selection_covers_entry`) the record reserves nothing and the picked entry
-  mints its identity, so the click is not sent back to the route it just left. The record
+  mints its identity, so the click is not sent back to the route it just left. Only a Save
+  that MOVED the route records a selection: the provider it persists differs from the one
+  the block was already on. An options-only Save posts the provider it found, selects no
+  entry, and must leave the route exactly as it was, so the record is written for a pick and
+  never for one of those; writing it anyway handed the slug to the entry on the next reload
+  and the chat authenticated at that entry's endpoint where the route had been the record's
+  (greptile P1, r37). The record
   is scoped to that one route: another provider, an entry whose own endpoint has been
   edited since, or no same-slug entry at all leaves the record owning the slug, and a Save
   naming no fallback entry drops the record. The record still owns the

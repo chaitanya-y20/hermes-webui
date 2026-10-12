@@ -2014,6 +2014,92 @@ def test_a_save_records_the_selection_and_only_for_the_entry_it_picked(monkeypat
     )
 
 
+def test_an_options_only_save_keeps_an_unmarked_routes_record_and_connection(monkeypatch, tmp_path):
+    """A Save that does not move the route selects nothing, and must change nothing.
+
+    The picker's record is what tells a route the user just selected apart from an EXISTING
+    configuration that merely holds both a same-slug fallback entry and a generic
+    ``providers['custom']`` record. An options-only Save posts the provider the block is
+    already on (a temperature, a model id), so it selects no entry: recording one handed the
+    slug to the entry on reload, which then served its own endpoint and key where the route
+    had been the record's, so the next chat authenticated somewhere the user never chose
+    (#8164 greptile P1). The record is written only when the Save moved the route, pinned by
+    the control at the end.
+    """
+    u_record = "http://generic.example/v1"
+    u_entry = "http://entry.example/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: chat-model\n"
+        "providers:\n"
+        "  custom:\n"
+        f"    base_url: {u_record}\n"
+        "    api_key: sk-generic\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {u_entry}\n"
+        "    api_key: sk-entry\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-generic", u_record), (
+        "control: the record the active model names serves this route before the save"
+    )
+
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    on_disk = _load(cfg_path)
+
+    assert config.CUSTOM_PROVIDER_SELECTION_FIELD not in on_disk["model"], (
+        "an options-only Save selects no entry, so it records none"
+    )
+    assert (
+        config._custom_provider_entry_identity(
+            on_disk["custom_providers"][0],
+            on_disk["custom_providers"],
+            on_disk["providers"],
+            on_disk["model"],
+        )
+        == ""
+    ), "and the entry mints no identity over the record"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-generic", u_record), (
+        "so the route the user was already on is exactly where it was"
+    )
+
+    picked_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: chat-model\n"
+        "providers:\n"
+        "  custom:\n"
+        f"    base_url: {u_record}\n"
+        "    api_key: sk-generic\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {u_entry}\n"
+        "    api_key: sk-entry\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: picked_path)
+    _load(picked_path)
+    config.set_hermes_default_model("chat-model", provider="custom:晨光")
+    picked = _load(picked_path)
+
+    assert picked["model"][config.CUSTOM_PROVIDER_SELECTION_FIELD] == {
+        "provider": "custom:晨光",
+        "base_url": u_entry,
+    }, "control: a Save that MOVED the route onto the entry still records the pick"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-entry", u_entry), (
+        "and the picked entry serves its own connection, so the gate is a gate"
+    )
+
+
 def test_a_same_endpoint_block_is_one_route_however_the_spelling_differs(monkeypatch):
     """The same-endpoint refusal and SELECTION must agree on endpoint equality.
 
