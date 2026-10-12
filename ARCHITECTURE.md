@@ -1127,7 +1127,12 @@ block that supplies the endpoint the entry does NOT declare, or that sits beside
 holding its own credential, is an authority of its own and keeps master's lookup. The
 Save path also treats a BLANK `advanced.base_url` (what the Settings panel posts when the
 field is empty, rather than omitting the key) as "no URL of my own", so a key-only save
-keeps the selected entry's endpoint instead of persisting a keyed block with none.
+keeps the endpoint the ROUTE serves instead of persisting a keyed block with none. That
+endpoint is resolved through `_select_custom_provider_record()` via
+`_selected_route_endpoint()`, not by looking a `custom_providers[]` entry up by name: when
+another record already owns the slug the entry mints no identity, is never served, and
+writing its URL onto the block sent an explicit override key to an endpoint the route had
+never used.
 
 ---
 

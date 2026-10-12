@@ -2283,3 +2283,63 @@ def test_the_settings_panel_payload_keeps_the_entry_endpoint(monkeypatch, tmp_pa
     assert on_disk["model"].get("base_url") == u_other, (
         "control: an explicit non-blank URL override still wins"
     )
+
+
+def test_a_key_only_save_keeps_the_endpoint_the_route_serves(monkeypatch, tmp_path):
+    """The restored endpoint is the one the route SERVES, not a same-slug entry's.
+
+    ``_selected_fallback_entry`` answers which entry this provider NAMES, by name
+    alone. A ``custom_providers[]`` entry whose slug another record already owns is
+    returned by it even though the selector never serves that entry, so the key-only
+    Save wrote the shadowed entry's URL onto the block and the override key went to an
+    endpoint the route never used (#8164 greptile P1). The endpoint is taken from the
+    record the selector serves, which here is the block itself.
+    """
+    u_route = "http://route.example/v1"
+    u_shadowed = "http://shadowed.example/v1"
+    cfg_path = _write_cfg(
+        tmp_path,
+        "model:\n"
+        "  provider: custom:晨光\n"
+        "  default: chat-model\n"
+        f"  base_url: {u_route}\n"
+        "  api_key: sk-route\n"
+        "custom_providers:\n"
+        "  - name: 晨光\n"
+        f"    base_url: {u_shadowed}\n"
+        "    api_key: sk-shadowed\n"
+        "    model: chat-model\n",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
+
+    _load(cfg_path)
+    # The block owns the slug, so the same-name entry is never served for this route.
+    assert config._custom_provider_identity_owners(
+        config.cfg.get("custom_providers"), config.cfg.get("providers"), config.cfg.get("model")
+    ) == {"晨光"}
+    assert (
+        config._unique_custom_provider_entry(
+            config.cfg.get("custom_providers"),
+            "晨光",
+            config.cfg.get("providers"),
+            config.cfg.get("model"),
+        )
+        is None
+    ), "the shadowed entry must not be the served authority"
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-route", u_route)
+
+    config.set_hermes_default_model(
+        "chat-model",
+        provider="custom:晨光",
+        advanced={"api_key": "sk-override", "base_url": ""},
+    )
+
+    on_disk = config._load_yaml_config_file(cfg_path)
+    assert on_disk["model"].get("base_url") == u_route, (
+        "a key-only Save keeps the endpoint the route serves, not the shadowed entry's"
+    )
+    assert config.resolve_custom_provider_connection("custom:晨光") == ("sk-override", u_route), (
+        "the override key serves at the endpoint the route was already on"
+    )

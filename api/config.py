@@ -7166,6 +7166,29 @@ def _model_block_serves_selected_custom_provider(provider: object, config_data: 
     return source == "model"
 
 
+def _selected_route_endpoint(provider: object, config_data: object) -> str:
+    """The endpoint ``provider``'s route SERVES right now, or ``""``.
+
+    Asked of the same authority every other routing decision uses, so the answer
+    cannot disagree with what the next chat does. The Save path needs this rather
+    than a same-slug ``custom_providers[]`` entry found by NAME: when another record
+    already owns the slug the entry mints nothing, is never served, and writing its
+    URL onto the block sent an explicit override key to an endpoint the route never
+    used (#8164 greptile P1). The record that owns the route is the one to keep.
+    """
+    pid = str(provider or "").strip().lower()
+    if not pid.startswith("custom:") or not isinstance(config_data, dict):
+        return ""
+    slug = _custom_provider_slug_key(pid)
+    if not slug:
+        return ""
+    try:
+        record, _source, _is_exact, _status = _select_custom_provider_record(pid, slug, config_data)
+    except Exception:
+        return ""
+    return str(_custom_record_base_url(record) or "")
+
+
 def _selected_fallback_entry(provider: object, config_data: object) -> dict | None:
     """The fallback-derived ``custom_providers[]`` entry ``provider`` names, or ``None``."""
     pid = str(provider or "").strip().lower()
@@ -7318,24 +7341,28 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
 
         _apply_advanced_model_options(model_cfg, advanced)
         # An explicit key with no URL of its own leaves the route with no endpoint,
-        # and the next chat fails. The selected fallback entry's URL is what the block
-        # was serving before the override, so keep it rather than persisting a
-        # key-only block (#8164 CORE).
+        # and the next chat fails. Keep the endpoint this route SERVES rather than
+        # persisting a key-only block (#8164 CORE).
         # The Settings panel posts ``advanced.base_url`` as ``""`` when the field is
         # blank, not omits it, so testing for the KEY's absence let the blank URL
         # through: ``_apply_advanced_model_options`` popped the endpoint and this
         # condition never restored it, leaving a keyed block with no endpoint and
         # ``custom_provider_endpoint_unresolved`` on the next chat (greptile r34).
+        # The endpoint is the one the ROUTE serves, resolved through the selector,
+        # not a same-slug ``custom_providers[]`` entry's URL found by name: when
+        # another record owns the slug the entry is never served, and writing its URL
+        # here sent the override key to an endpoint the route never used, where the
+        # route's own endpoint is the one the user was already on (#8164 greptile P1).
         # A non-blank override still wins, because the block then HAS an endpoint.
         if (
-            selected_fallback_entry is not None
-            and isinstance(advanced, dict)
+            isinstance(advanced, dict)
             and str(advanced.get("api_key") or "").strip()
             and not str(advanced.get("base_url") or "").strip()
             and not model_cfg.get("base_url")
-            and selected_fallback_entry.get("base_url")
         ):
-            model_cfg["base_url"] = str(selected_fallback_entry["base_url"]).strip().rstrip("/")
+            _route_endpoint = _selected_route_endpoint(persisted_provider, previous_config_data)
+            if _route_endpoint:
+                model_cfg["base_url"] = _route_endpoint
         if not _main_model_supports_service_tier(persisted_model, persisted_provider):
             model_cfg.pop("service_tier", None)
 
